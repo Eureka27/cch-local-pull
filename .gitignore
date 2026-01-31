@@ -1,0 +1,6 @@
+node_modules/
+state/
+.zcf/
+config/*.json
+!config/*.example.json
+*.log

@@ -1,0 +1,15 @@
+{
+  "name": "local_pull",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "client": "node src/client.js --config config/client.json"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}
