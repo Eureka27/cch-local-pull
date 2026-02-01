@@ -61,6 +61,10 @@ async function doPull(lastIdx) {
     let completedFiles = 0;
     let currentFile = null;
     let truncated = false;
+    let batchId = null;
+    let pendingNextIdx = null;
+    let awaitingAck = false;
+    let ackTimer = null;
     let queue = Promise.resolve();
 
     ws.on("open", () => {
@@ -82,7 +86,13 @@ async function doPull(lastIdx) {
         });
     });
 
-    ws.on("close", () => resolve());
+    ws.on("close", () => {
+      if (ackTimer) {
+        clearTimeout(ackTimer);
+        ackTimer = null;
+      }
+      resolve();
+    });
     ws.on("error", (err) => {
       console.error("ws error", err);
       resolve();
@@ -106,6 +116,7 @@ async function doPull(lastIdx) {
       if (msg.type === "delta") {
         expectedFiles = Array.isArray(msg.items) ? msg.items.length : 0;
         truncated = Boolean(msg.truncated);
+        batchId = msg.batch_id || batchId;
 
         if (Array.isArray(msg.deletions)) {
           for (const del of msg.deletions) {
@@ -136,7 +147,40 @@ async function doPull(lastIdx) {
           ws.close();
           return;
         }
-        await writeJson(config.last_idx_path, normalizeIdx(msg.next_idx));
+        pendingNextIdx = normalizeIdx(msg.next_idx);
+        if (!msg.batch_id && !batchId) {
+          await writeJson(config.last_idx_path, pendingNextIdx);
+          ws.close();
+          if (truncated && !runOnce) {
+            setTimeout(() => {
+              if (!pulling) {
+                pullOnce();
+              }
+            }, 1000);
+          }
+          return;
+        }
+
+        if (msg.batch_id) {
+          batchId = msg.batch_id;
+        }
+        awaitingAck = true;
+        startAckTimer();
+        ws.send(JSON.stringify({ type: "ack", batch_id: batchId }));
+        return;
+      }
+
+      if (msg.type === "ack_ok") {
+        if (!awaitingAck || msg.batch_id !== batchId) {
+          return;
+        }
+        awaitingAck = false;
+        clearAckTimer();
+        if (!pendingNextIdx) {
+          ws.close();
+          return;
+        }
+        await writeJson(config.last_idx_path, pendingNextIdx);
         ws.close();
         if (truncated && !runOnce) {
           setTimeout(() => {
@@ -145,7 +189,37 @@ async function doPull(lastIdx) {
             }
           }, 1000);
         }
+        return;
       }
+
+      if (msg.type === "ack_error") {
+        if (!awaitingAck || msg.batch_id !== batchId) {
+          return;
+        }
+        awaitingAck = false;
+        clearAckTimer();
+        console.error("ack failed", msg.error || "unknown");
+        ws.close();
+      }
+    }
+
+    function startAckTimer() {
+      clearAckTimer();
+      ackTimer = setTimeout(() => {
+        if (!awaitingAck) {
+          return;
+        }
+        console.error("ack timeout");
+        ws.close();
+      }, config.ack_timeout_seconds * 1000);
+    }
+
+    function clearAckTimer() {
+      if (!ackTimer) {
+        return;
+      }
+      clearTimeout(ackTimer);
+      ackTimer = null;
     }
   });
 }
@@ -175,6 +249,11 @@ function validateConfig(cfg) {
     cfg.pull_interval_seconds = 1200;
   } else {
     cfg.pull_interval_seconds = Number(cfg.pull_interval_seconds);
+  }
+  if (!cfg.ack_timeout_seconds || Number(cfg.ack_timeout_seconds) <= 0) {
+    cfg.ack_timeout_seconds = 120;
+  } else {
+    cfg.ack_timeout_seconds = Number(cfg.ack_timeout_seconds);
   }
 }
 

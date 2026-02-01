@@ -7,5 +7,6 @@
   "dest_dir": "/path/to/cch-sessions",
   "last_idx_path": "./state/last_idx.json",
   "pull_interval_seconds": 1200,
-  "max_batch_bytes": 3221225472
+  "max_batch_bytes": 3221225472,
+  "ack_timeout_seconds": 120
 }
