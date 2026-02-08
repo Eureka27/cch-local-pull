@@ -1,0 +1,17 @@
+{
+  "host": "0.0.0.0",
+  "port": 23050,
+  "session_dir": "/path/to/session",
+  "state_dir": "./state",
+  "trash_dir": "./trash",
+  "trash_ttl_days": 7,
+  "trash_cleanup_interval_seconds": 600,
+  "trash_max_bytes": 5368709120,
+  "auth": {
+    "user": "pull",
+    "pass": "CHANGE_ME"
+  },
+  "max_batch_bytes": 3221225472,
+  "chunk_bytes": 1048576,
+  "ack_timeout_seconds": 120
+}
