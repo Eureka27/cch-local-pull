@@ -24,6 +24,13 @@ Edit `config/server.json`:
 - `session_dir`: source directory (e.g. `/path/to/session`)
 - `auth.user` / `auth.pass`
 - `port` (default 23050)
+- `trash_dir`: trash directory for acked files (default `./trash`)
+- `trash_ttl_days`: trash retention days (default `7`)
+- `trash_cleanup_interval_seconds`: trash cleanup interval (default `600`)
+- `trash_max_bytes`: trash size cap in bytes (default `5368709120`)
+- `ack_timeout_seconds`: ack wait timeout (default `120`)
+- `deletions_log_max_lines`: max lines kept in `state/deletions.jsonl` (default `200000`)
+- `deletions_log_cleanup_interval_seconds`: deletions log compact interval (default `600`)
 
 2) Start
 
@@ -45,6 +52,7 @@ Edit `config/client.json`:
 - `server_url`: `ws://SOURCE_IP:23050`
 - `dest_dir`: target directory (e.g. `/path/to/cch-sessions`)
 - `auth.user` / `auth.pass`
+- `ack_timeout_seconds`: ack wait timeout (default `120`)
 
 2) Start
 

@@ -22,7 +22,12 @@ const trashDir = path.resolve(process.cwd(), config.trash_dir);
 const trashTtlMs = config.trash_ttl_days * 24 * 60 * 60 * 1000;
 const ackTimeoutMs = config.ack_timeout_seconds * 1000;
 const trashMaxBytes = config.trash_max_bytes;
+const deletionsLogMaxLines = config.deletions_log_max_lines;
+const deletionsLogCleanupIntervalMs =
+  config.deletions_log_cleanup_interval_seconds * 1000;
 let lastTrashCleanupAt = 0;
+let lastDeletionsCleanupAt = 0;
+let deletionsFileQueue = Promise.resolve();
 
 const server = http.createServer();
 const wss = new WebSocketServer({ noServer: true });
@@ -213,6 +218,21 @@ function validateConfig(cfg) {
     cfg.trash_max_bytes = 5 * 1024 * 1024 * 1024;
   } else {
     cfg.trash_max_bytes = Number(cfg.trash_max_bytes);
+  }
+  if (!cfg.deletions_log_max_lines || Number(cfg.deletions_log_max_lines) <= 0) {
+    cfg.deletions_log_max_lines = 200000;
+  } else {
+    cfg.deletions_log_max_lines = Number(cfg.deletions_log_max_lines);
+  }
+  if (
+    !cfg.deletions_log_cleanup_interval_seconds
+    || Number(cfg.deletions_log_cleanup_interval_seconds) <= 0
+  ) {
+    cfg.deletions_log_cleanup_interval_seconds = 600;
+  } else {
+    cfg.deletions_log_cleanup_interval_seconds = Number(
+      cfg.deletions_log_cleanup_interval_seconds,
+    );
   }
 }
 
@@ -603,13 +623,61 @@ async function updateSnapshotAfterTrash(movedIds) {
 }
 
 async function appendDeletions(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return;
+  }
   await ensureDir(stateDir);
   const lines = entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
-  await fs.promises.appendFile(deletionsPath, lines, "utf8");
+  deletionsFileQueue = deletionsFileQueue
+    .then(async () => {
+      await fs.promises.appendFile(deletionsPath, lines, "utf8");
+      await maybeCompactDeletionsLog();
+    })
+    .catch((err) => {
+      console.error("deletions log update failed", err);
+    });
+  await deletionsFileQueue;
+}
+
+async function maybeCompactDeletionsLog() {
+  const now = Date.now();
+  if (
+    lastDeletionsCleanupAt > 0
+    && now - lastDeletionsCleanupAt < deletionsLogCleanupIntervalMs
+  ) {
+    return;
+  }
+  lastDeletionsCleanupAt = now;
+  await compactDeletionsLog();
+}
+
+async function compactDeletionsLog() {
+  if (!deletionsLogMaxLines || deletionsLogMaxLines <= 0) {
+    return;
+  }
+  let raw;
+  try {
+    raw = await fs.promises.readFile(deletionsPath, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return;
+    }
+    throw err;
+  }
+  const lines = raw.split("\n").filter((line) => line.trim().length > 0);
+  if (lines.length <= deletionsLogMaxLines) {
+    return;
+  }
+  const keep = lines.slice(lines.length - deletionsLogMaxLines);
+  const nextRaw = `${keep.join("\n")}\n`;
+  const tmpPath = `${deletionsPath}.tmp`;
+  await fs.promises.writeFile(tmpPath, nextRaw, "utf8");
+  await fs.promises.rename(tmpPath, deletionsPath);
 }
 
 async function readDeletionsAfter(lastIdx) {
   try {
+    await deletionsFileQueue;
     const raw = await fs.promises.readFile(deletionsPath, "utf8");
     const lines = raw.split("\n").filter((line) => line.trim().length > 0);
     const results = [];

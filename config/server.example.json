@@ -13,5 +13,7 @@
   },
   "max_batch_bytes": 3221225472,
   "chunk_bytes": 1048576,
-  "ack_timeout_seconds": 120
+  "ack_timeout_seconds": 120,
+  "deletions_log_max_lines": 200000,
+  "deletions_log_cleanup_interval_seconds": 600
 }
