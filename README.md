@@ -9,7 +9,6 @@ Local pull client for claude-code-hub sessions. Incremental sync over WebSocket 
 - Bidirectional delete sync.
 - Batch size limit per pull (default 3GB).
 - Only `.json` files are synced from the session directory.
-- Optional client-side merge (`sessionId/req-*.json` -> `sessionId.json`).
 
 ## Source Server (WS server)
 
@@ -46,9 +45,6 @@ Edit `config/client.json`:
 - `server_url`: `ws://SOURCE_IP:23050`
 - `dest_dir`: target directory (e.g. `/path/to/cch-sessions`)
 - `auth.user` / `auth.pass`
-- `enable_session_merge`: enable local merge (default `false`)
-- `merged_dir`: merged output directory (default `${dest_dir}/_merged`)
-- `merge_state_path`: merge state file (default `./state/merge_state.json`)
 
 2) Start
 
@@ -63,13 +59,6 @@ node src/client.js --config config/client.json
 ```bash
 node src/client.js --config config/client.json --once
 ```
-
-### Merge behavior (client)
-
-- Triggered after successful `ack_ok`.
-- Reads shards from `dest_dir/<session_id>/req-*.json`.
-- Rebuilds merged file to `merged_dir/<session_id>.json` using atomic rename.
-- Merge errors do not break pull/ack workflow.
 
 ## Deploy (systemd)
 
