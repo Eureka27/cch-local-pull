@@ -5,6 +5,10 @@ const WebSocket = require("ws");
 const { loadConfig, getArgValue } = require("./shared/config");
 const { ensureDir, readJson, writeJson, safeJoin } = require("./shared/fs");
 const { normalizeIdx } = require("./shared/idx");
+const {
+  extractSessionIdFromFileId,
+  rebuildSessionArtifacts,
+} = require("./shared/session_rebuild");
 
 const argv = process.argv.slice(2);
 const configPath = getArgValue(argv, "--config") || "config/client.json";
@@ -14,12 +18,15 @@ const config = loadConfig(configPath);
 validateConfig(config);
 
 const stateDir = path.resolve(process.cwd(), path.dirname(config.last_idx_path));
+const sessionRebuildCache = new Map();
 let pulling = false;
 
 start();
 
 async function start() {
-  await ensureDir(config.dest_dir);
+  await ensureDir(config.raw_dir);
+  await ensureDir(config.processed_dir);
+  await ensureDir(config.reports_dir);
   await ensureDir(stateDir);
 
   await pullOnce();
@@ -57,6 +64,7 @@ async function doPull(lastIdx) {
       },
     });
 
+    const affectedSessionIds = new Set();
     let expectedFiles = 0;
     let completedFiles = 0;
     let currentFile = null;
@@ -118,9 +126,16 @@ async function doPull(lastIdx) {
         truncated = Boolean(msg.truncated);
         batchId = msg.batch_id || batchId;
 
+        if (Array.isArray(msg.items)) {
+          for (const item of msg.items) {
+            addAffectedSessionById(affectedSessionIds, item && item.id);
+          }
+        }
+
         if (Array.isArray(msg.deletions)) {
           for (const del of msg.deletions) {
-            await applyDeletion(del.id);
+            addAffectedSessionById(affectedSessionIds, del && del.id);
+            await applyDeletion(del && del.id);
           }
         }
         return;
@@ -128,6 +143,7 @@ async function doPull(lastIdx) {
 
       if (msg.type === "file_start") {
         currentFile = await openFile(msg);
+        addAffectedSessionById(affectedSessionIds, currentFile.id);
         return;
       }
 
@@ -150,6 +166,7 @@ async function doPull(lastIdx) {
         pendingNextIdx = normalizeIdx(msg.next_idx);
         if (!msg.batch_id && !batchId) {
           await writeJson(config.last_idx_path, pendingNextIdx);
+          await rebuildAffectedSessions(affectedSessionIds);
           ws.close();
           if (truncated && !runOnce) {
             setTimeout(() => {
@@ -181,6 +198,7 @@ async function doPull(lastIdx) {
           return;
         }
         await writeJson(config.last_idx_path, pendingNextIdx);
+        await rebuildAffectedSessions(affectedSessionIds);
         ws.close();
         if (truncated && !runOnce) {
           setTimeout(() => {
@@ -231,11 +249,21 @@ function validateConfig(cfg) {
   if (!cfg.server_url) {
     throw new Error("server_url is required");
   }
-  if (!cfg.dest_dir) {
-    throw new Error("dest_dir is required");
-  }
   if (!cfg.auth || !cfg.auth.user || !cfg.auth.pass) {
     throw new Error("auth.user and auth.pass are required");
+  }
+
+  if (!cfg.raw_dir && cfg.dest_dir) {
+    cfg.raw_dir = cfg.dest_dir;
+  }
+  if (!cfg.raw_dir) {
+    throw new Error("raw_dir is required (or provide legacy dest_dir)");
+  }
+  if (!cfg.processed_dir) {
+    cfg.processed_dir = `${cfg.raw_dir}_processed`;
+  }
+  if (!cfg.reports_dir) {
+    cfg.reports_dir = "./state/reports";
   }
   if (!cfg.last_idx_path) {
     cfg.last_idx_path = "./state/last_idx.json";
@@ -255,6 +283,24 @@ function validateConfig(cfg) {
   } else {
     cfg.ack_timeout_seconds = Number(cfg.ack_timeout_seconds);
   }
+  if (cfg.strict_sequence_start_at_one === undefined) {
+    cfg.strict_sequence_start_at_one = true;
+  } else {
+    cfg.strict_sequence_start_at_one = Boolean(cfg.strict_sequence_start_at_one);
+  }
+  if (!cfg.dup_name_strategy) {
+    cfg.dup_name_strategy = "suffix-ts-counter";
+  }
+  if (cfg.dup_name_strategy !== "suffix-ts-counter") {
+    throw new Error("dup_name_strategy only supports suffix-ts-counter");
+  }
+  if (!cfg.rebuild_concurrency || Number(cfg.rebuild_concurrency) <= 0) {
+    cfg.rebuild_concurrency = 2;
+  } else {
+    cfg.rebuild_concurrency = Number(cfg.rebuild_concurrency);
+  }
+
+  cfg.dest_dir = cfg.raw_dir;
 }
 
 function buildBasicAuth(user, pass) {
@@ -272,16 +318,82 @@ function parseJsonMessage(data) {
   }
 }
 
+function addAffectedSessionById(affectedSessionIds, id) {
+  const sessionId = extractSessionIdFromFileId(id);
+  if (!sessionId) {
+    return;
+  }
+  affectedSessionIds.add(sessionId);
+}
+
+async function rebuildAffectedSessions(affectedSessionIds) {
+  if (!affectedSessionIds || affectedSessionIds.size === 0) {
+    return;
+  }
+  const sessionIds = Array.from(affectedSessionIds).sort();
+  const concurrency = Math.max(
+    1,
+    Math.min(sessionIds.length, Math.floor(config.rebuild_concurrency)),
+  );
+  let cursor = 0;
+  const workers = [];
+  for (let index = 0; index < concurrency; index += 1) {
+    workers.push((async () => {
+      while (true) {
+        const current = cursor;
+        cursor += 1;
+        if (current >= sessionIds.length) {
+          return;
+        }
+        const sessionId = sessionIds[current];
+        try {
+          const report = await rebuildSessionArtifacts({
+            rawDir: config.raw_dir,
+            processedDir: config.processed_dir,
+            reportsDir: config.reports_dir,
+            sessionId,
+            strictSequenceStartAtOne: config.strict_sequence_start_at_one,
+            cache: sessionRebuildCache,
+          });
+          console.log(
+            `[rebuild] session=${report.session_id} status=${report.output.status} events=${report.output.event_count} continuous=${report.continuity.continuous} cache_hit=${report.cache_hit === true}`,
+          );
+        } catch (err) {
+          console.error(`[rebuild] session=${sessionId} failed`, err);
+        }
+      }
+    })());
+  }
+  await Promise.all(workers);
+}
+
 async function applyDeletion(id) {
   if (!id) {
     return;
   }
+  const target = safeJoin(config.raw_dir, id);
+  await safeUnlink(target);
+  await removeSiblingDupFiles(target);
+  await removeEmptyParents(path.dirname(target), config.raw_dir);
+}
+
+async function removeSiblingDupFiles(targetPath) {
+  const dir = path.dirname(targetPath);
+  const base = path.basename(targetPath);
+  let entries = [];
   try {
-    const target = safeJoin(config.dest_dir, id);
-    await fs.promises.unlink(target);
-    await removeEmptyParents(path.dirname(target));
+    entries = await fs.promises.readdir(dir, { withFileTypes: true });
   } catch (err) {
     return;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    if (!entry.name.startsWith(`${base}.dup-`)) {
+      continue;
+    }
+    await safeUnlink(path.join(dir, entry.name));
   }
 }
 
@@ -289,7 +401,7 @@ async function openFile(msg) {
   if (!msg || !msg.id) {
     throw new Error("invalid file_start");
   }
-  const target = safeJoin(config.dest_dir, msg.id);
+  const target = safeJoin(config.raw_dir, msg.id);
   await ensureDir(path.dirname(target));
   const tempPath = makeTempPath(target);
   const stream = fs.createWriteStream(tempPath, { flags: "w" });
@@ -320,7 +432,31 @@ async function closeFile(fileState, msg) {
     await safeUnlink(fileState.tempPath);
     throw new Error("file size mismatch");
   }
-  await fs.promises.rename(fileState.tempPath, fileState.targetPath);
+  const finalTargetPath = await resolveFinalTargetPath(fileState.targetPath);
+  await fs.promises.rename(fileState.tempPath, finalTargetPath);
+}
+
+async function resolveFinalTargetPath(targetPath) {
+  if (!(await pathExists(targetPath))) {
+    return targetPath;
+  }
+  let attempt = 1;
+  while (true) {
+    const candidate = `${targetPath}.dup-${Date.now()}-${attempt}`;
+    if (!(await pathExists(candidate))) {
+      return candidate;
+    }
+    attempt += 1;
+  }
+}
+
+async function pathExists(filePath) {
+  try {
+    await fs.promises.access(filePath, fs.constants.F_OK);
+    return true;
+  } catch (err) {
+    return false;
+  }
 }
 
 function onceDrain(stream) {
@@ -344,8 +480,8 @@ async function safeUnlink(filePath) {
   }
 }
 
-async function removeEmptyParents(startDir) {
-  const root = path.resolve(config.dest_dir);
+async function removeEmptyParents(startDir, rootDir) {
+  const root = path.resolve(rootDir);
   let current = path.resolve(startDir);
   while (current.startsWith(root + path.sep)) {
     try {

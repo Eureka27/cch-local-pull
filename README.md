@@ -9,6 +9,13 @@ Local pull client for claude-code-hub sessions. Incremental sync over WebSocket 
 - Bidirectional delete sync.
 - Batch size limit per pull (default 3GB).
 - Only `.json` files are synced from the session directory.
+- Client dual-path output:
+  - `raw_dir`: raw pulled files (same-name collision saved as `.json.dup-*`)
+  - `processed_dir`: rebuilt JSONL by `session_id` (single output file per session)
+- Dedup/continuity check:
+  - dedupe key = `requestSequence + type + payload`
+  - strict sequence continuity = `1..max(requestSequence)`
+  - incomplete sessions are written to `processed_dir/_incomplete/`
 
 ## Source Server (WS server)
 
@@ -50,9 +57,17 @@ cp config/client.example.json config/client.json
 
 Edit `config/client.json`:
 - `server_url`: `ws://SOURCE_IP:23050`
-- `dest_dir`: target directory (e.g. `/path/to/cch-sessions`)
+- `raw_dir`: raw pull directory (e.g. `/path/to/cch-sessions/raw`)
+- `processed_dir`: rebuilt output directory (e.g. `/path/to/cch-sessions/processed`)
+- `reports_dir`: rebuild report directory (default `./state/reports`)
+- `strict_sequence_start_at_one`: strict continuity check, default `true`
+- `dup_name_strategy`: duplicate naming strategy, fixed as `suffix-ts-counter`
+- `rebuild_concurrency`: session rebuild concurrency, default `2`
 - `auth.user` / `auth.pass`
 - `ack_timeout_seconds`: ack wait timeout (default `120`)
+
+Compatibility note:
+- Legacy `dest_dir` is still accepted and treated as `raw_dir` when `raw_dir` is not provided.
 
 2) Start
 
@@ -67,6 +82,12 @@ node src/client.js --config config/client.json
 ```bash
 node src/client.js --config config/client.json --once
 ```
+
+Rebuild output behavior:
+- If session is continuous: `processed_dir/<session_id>.json`
+- If session is not continuous: `processed_dir/_incomplete/<session_id>.json`
+- Per-session report: `reports_dir/<session_id>.json`
+- Unchanged session inputs are skipped by in-memory rebuild cache
 
 ## Deploy (systemd)
 
