@@ -9,13 +9,13 @@ Local pull client for claude-code-hub sessions. Incremental sync over WebSocket 
 - Bidirectional delete sync.
 - Batch size limit per pull (default 3GB).
 - Only `.json` files are synced from the session directory.
-- Client dual-path output:
-  - `raw_dir`: raw pulled files (same-name collision saved as `.json.dup-*`)
-  - `processed_dir`: rebuilt JSONL by `session_id` (single output file per session)
-- Dedup/continuity check:
+- Client single-path output:
+  - `raw_dir`: canonical session JSON files.
+  - same-name collisions are saved as `.json.dup-*`, then merged back into the canonical session JSON.
+- Dup repair behavior:
   - dedupe key = `requestSequence + type + payload`
-  - strict sequence continuity = `1..max(requestSequence)`
-  - incomplete sessions are written to `processed_dir/_incomplete/`
+  - conflict key = `requestSequence + type`, newer source wins
+  - report is written only when dup repair is triggered
 
 ## Source Server (WS server)
 
@@ -57,12 +57,9 @@ cp config/client.example.json config/client.json
 
 Edit `config/client.json`:
 - `server_url`: `ws://SOURCE_IP:23050`
-- `raw_dir`: raw pull directory (e.g. `/path/to/cch-sessions/raw`)
-- `processed_dir`: rebuilt output directory (e.g. `/path/to/cch-sessions/processed`)
-- `reports_dir`: rebuild report directory (default `./state/reports`)
-- `strict_sequence_start_at_one`: strict continuity check, default `true`
+- `raw_dir`: pull directory and canonical output directory (e.g. `/path/to/cch-sessions/raw`)
+- `reports_dir`: dup repair report directory (default `./state/reports`)
 - `dup_name_strategy`: duplicate naming strategy, fixed as `suffix-ts-counter`
-- `rebuild_concurrency`: session rebuild concurrency, default `2`
 - `auth.user` / `auth.pass`
 - `ack_timeout_seconds`: ack wait timeout (default `120`)
 
@@ -83,11 +80,12 @@ node src/client.js --config config/client.json
 node src/client.js --config config/client.json --once
 ```
 
-Rebuild output behavior:
-- If session is continuous: `processed_dir/<session_id>.json`
-- If session is not continuous: `processed_dir/_incomplete/<session_id>.json`
-- Per-session report: `reports_dir/<session_id>.json`
-- Unchanged session inputs are skipped by in-memory rebuild cache
+Dup repair behavior:
+- Default write path: `raw_dir/<session_id>.json`
+- On same-name collision, incoming file is written to `raw_dir/<session_id>.json.dup-*`
+- The client merges `session.json` + matching dup files into `raw_dir/<session_id>.json`
+- After merge, matching dup files are removed
+- Per-session report: `reports_dir/<session_id>.json` (only when dup repair happens)
 
 ## Deploy (systemd)
 

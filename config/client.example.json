@@ -5,11 +5,8 @@
     "pass": "CHANGE_ME"
   },
   "raw_dir": "/path/to/cch-sessions/raw",
-  "processed_dir": "/path/to/cch-sessions/processed",
   "reports_dir": "/path/to/cch-sessions/reports",
-  "strict_sequence_start_at_one": true,
   "dup_name_strategy": "suffix-ts-counter",
-  "rebuild_concurrency": 2,
   "last_idx_path": "./state/last_idx.json",
   "pull_interval_seconds": 1200,
   "max_batch_bytes": 3221225472,
