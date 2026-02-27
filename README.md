@@ -17,6 +17,17 @@ Local pull client for claude-code-hub sessions. Incremental sync over WebSocket 
   - conflict key = `requestSequence + type`, newer source wins
   - report is written only when dup repair is triggered
 
+<<<<<<< HEAD
+=======
+## One-click Deploy
+
+Edit config at the top of `deploy/deploy-oneclick.sh`, then run:
+
+```bash
+bash deploy/deploy-oneclick.sh
+```
+
+>>>>>>> 26b40ab (feat: add one-click deploy script and README quick deploy section)
 ## Source Server (WS server)
 
 1) Install and prepare config
