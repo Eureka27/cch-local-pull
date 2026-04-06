@@ -390,8 +390,35 @@ function validateConfig(cfg) {
   if (!["session_merge", "overwrite"].includes(cfg.existing_file_strategy)) {
     throw new Error("existing_file_strategy must be session_merge or overwrite");
   }
+  cfg.session_merge_prefixes = normalizeRelativeDirPrefixes(cfg.session_merge_prefixes);
 
   cfg.dest_dir = cfg.raw_dir;
+}
+
+function normalizeRelativeDirPrefixes(value) {
+  if (!Array.isArray(value) || value.length === 0) {
+    return [];
+  }
+  const normalized = [];
+  const seen = new Set();
+  for (const item of value) {
+    if (typeof item !== "string") {
+      continue;
+    }
+    let prefix = item.trim().replace(/\\/g, "/").replace(/^\/+/, "");
+    prefix = prefix.replace(/\/+$/, "");
+    if (!prefix) {
+      continue;
+    }
+    const finalPrefix = `${prefix}/`;
+    const dedupeKey = finalPrefix.toLowerCase();
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+    seen.add(dedupeKey);
+    normalized.push(finalPrefix);
+  }
+  return normalized;
 }
 
 function buildBasicAuth(user, pass) {
@@ -417,14 +444,30 @@ function extractSessionIdFromFileId(fileId) {
   if (!normalized) {
     return null;
   }
-  const first = normalized.split("/")[0];
-  if (!first) {
+  const parts = normalized.split("/");
+  const last = parts[parts.length - 1];
+  if (!last) {
     return null;
   }
-  let value = String(first);
+  let value = String(last);
   value = value.replace(/\.json\.dup-\d+-\d+$/i, "");
   value = value.replace(/\.json$/i, "");
   return value || null;
+}
+
+function resolveWriteStrategy(fileId, cfg) {
+  const normalized = String(fileId || "").replace(/\\/g, "/").replace(/^\/+/, "");
+  if (!normalized) {
+    return cfg.existing_file_strategy;
+  }
+  const lowerId = normalized.toLowerCase();
+  for (const prefix of cfg.session_merge_prefixes) {
+    const lowerPrefix = prefix.toLowerCase();
+    if (lowerId.startsWith(lowerPrefix)) {
+      return "session_merge";
+    }
+  }
+  return cfg.existing_file_strategy;
 }
 
 async function applyDeletion(id) {
@@ -462,6 +505,10 @@ async function openFile(msg) {
     throw new Error("invalid file_start");
   }
   const target = safeJoin(config.raw_dir, msg.id);
+  const writeStrategy = resolveWriteStrategy(msg.id, config);
+  const sessionId = writeStrategy === "session_merge"
+    ? extractSessionIdFromFileId(msg.id)
+    : null;
   await ensureDir(path.dirname(target));
   const tempPath = makeTempPath(target);
   const stream = fs.createWriteStream(tempPath, { flags: "w" });
@@ -472,6 +519,8 @@ async function openFile(msg) {
     received: 0,
     tempPath,
     targetPath: target,
+    writeStrategy,
+    sessionId,
     stream,
   };
 }
@@ -493,20 +542,20 @@ async function closeFile(fileState, msg) {
     throw new Error("file size mismatch");
   }
   const targetExists = await pathExists(fileState.targetPath);
-  if (!targetExists || config.existing_file_strategy === "overwrite") {
+  if (!targetExists || fileState.writeStrategy === "overwrite") {
     await fs.promises.rename(fileState.tempPath, fileState.targetPath);
     return;
   }
   const finalTargetPath = await resolveFinalTargetPath(fileState.targetPath);
   await fs.promises.rename(fileState.tempPath, finalTargetPath);
-  const sessionId = extractSessionIdFromFileId(fileState.id);
+  const sessionId = fileState.sessionId;
   if (!sessionId) {
     return;
   }
   try {
     const report = await rebuildSessionFromDup({
       sessionId,
-      rawDir: config.raw_dir,
+      rawDir: path.dirname(fileState.targetPath),
       reportsDir: config.reports_dir,
       safeUnlink,
       removeEmptyParents,

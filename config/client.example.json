@@ -7,6 +7,7 @@
   "raw_dir": "./pulled/export",
   "reports_dir": "./state/reports",
   "existing_file_strategy": "overwrite",
+  "session_merge_prefixes": ["redis/session_events/"],
   "dup_name_strategy": "suffix-ts-counter",
   "last_idx_path": "./state/last_idx.json",
   "pull_interval_seconds": 7200,

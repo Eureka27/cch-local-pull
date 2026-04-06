@@ -14,6 +14,7 @@ Local pull toolkit for `claude-code-hub` exported data and flat session JSON fil
 - Two collision strategies on the client:
   - `overwrite`: replace the local file with the source file. This is the default and the recommended mode for exporter roots such as `./export`.
   - `session_merge`: keep duplicate session JSON files, rebuild a canonical `<session_id>.json`, and write a report when a rebuild happens.
+- Path-based `session_merge` overrides are supported, so one subtree such as `redis/session_events/` can use merge while everything else stays on `overwrite`.
 
 ## One-click Deploy
 
@@ -32,6 +33,7 @@ Important variables in `deploy/deploy-oneclick.sh`:
 - `CLIENT_RAW_DIR`
 - `CLIENT_REPORTS_DIR`
 - `CLIENT_EXISTING_FILE_STRATEGY`: `overwrite` or `session_merge`
+- `CLIENT_SESSION_MERGE_PREFIXES`: default `["redis/session_events/"]`
 - `CLIENT_PULL_INTERVAL_SECONDS`: default `7200`
 - `CLIENT_EAGER_PULL_PENDING_BYTES`: default `2147483648` (`2GiB`)
 - `CLIENT_EAGER_PULL_CHECK_INTERVAL_SECONDS`: default `60`
@@ -94,6 +96,7 @@ Key fields in `config/client.json`:
 - `raw_dir`: local destination root for pulled files
 - `reports_dir`: report directory used by `session_merge`
 - `existing_file_strategy`: `overwrite` or `session_merge`
+- `session_merge_prefixes`: relative directory prefixes that force `session_merge`, for example `["redis/session_events/"]`
 - `dup_name_strategy`: fixed as `suffix-ts-counter`
 - `auth.user` / `auth.pass`
 - `last_idx_path`
@@ -109,12 +112,18 @@ Typical exporter-root client config:
 {
   "raw_dir": "./pulled/export",
   "existing_file_strategy": "overwrite",
+  "session_merge_prefixes": ["redis/session_events/"],
   "pull_interval_seconds": 7200,
   "eager_pull_pending_bytes": 2147483648
 }
 ```
 
-Use `session_merge` only when the source side is a flat per-session JSON directory and you want duplicate session files consolidated back into one canonical `<session_id>.json`.
+In exporter-root mode, a practical setup is:
+- `redis/session_events/` uses `session_merge`
+- `redis/request_sidecars/` uses `overwrite`
+- `db/` uses `overwrite`
+
+If the source side is a flat per-session JSON directory, you can still set `existing_file_strategy` to `session_merge` for the whole pull root and omit `session_merge_prefixes`.
 
 Compatibility note:
 - Legacy `dest_dir` is still accepted and treated as `raw_dir` when `raw_dir` is not provided.

@@ -18,6 +18,7 @@ CLIENT_AUTH_PASS="CHANGE_ME"
 CLIENT_RAW_DIR="./pulled/export"
 CLIENT_REPORTS_DIR="./state/reports"
 CLIENT_EXISTING_FILE_STRATEGY="overwrite"
+CLIENT_SESSION_MERGE_PREFIXES='["redis/session_events/"]'
 CLIENT_PULL_INTERVAL_SECONDS="7200"
 CLIENT_EAGER_PULL_PENDING_BYTES="2147483648"
 CLIENT_EAGER_PULL_CHECK_INTERVAL_SECONDS="60"
@@ -139,6 +140,7 @@ write_client_config() {
   "raw_dir": "${CLIENT_RAW_DIR_ABS}",
   "reports_dir": "${CLIENT_REPORTS_DIR_ABS}",
   "existing_file_strategy": "${CLIENT_EXISTING_FILE_STRATEGY}",
+  "session_merge_prefixes": ${CLIENT_SESSION_MERGE_PREFIXES},
   "dup_name_strategy": "suffix-ts-counter",
   "last_idx_path": "${REPO_ROOT}/state/last_idx.json",
   "pull_interval_seconds": ${CLIENT_PULL_INTERVAL_SECONDS},
