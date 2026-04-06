@@ -287,7 +287,11 @@ function normalizeExcludePrefixes(value) {
     if (typeof item !== "string") {
       continue;
     }
-    let prefix = item.trim().replace(/\\/g, "/").replace(/^\/+/, "");
+    let prefix = item
+      .trim()
+      .replace(/\\/g, "/")
+      .replace(/^\/+/, "")
+      .replace(/\/+$/, "");
     if (!prefix) {
       continue;
     }
