@@ -1,11 +1,12 @@
 {
-  "server_url": "ws://YOUR_HOST:23050",
+  "server_url": "ws://source.example.com:23050",
   "auth": {
     "user": "pull",
     "pass": "CHANGE_ME"
   },
-  "raw_dir": "/path/to/cch-sessions/raw",
-  "reports_dir": "/path/to/cch-sessions/reports",
+  "raw_dir": "./pulled/export",
+  "reports_dir": "./state/reports",
+  "existing_file_strategy": "overwrite",
   "dup_name_strategy": "suffix-ts-counter",
   "last_idx_path": "./state/last_idx.json",
   "pull_interval_seconds": 1200,

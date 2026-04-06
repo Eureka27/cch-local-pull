@@ -271,6 +271,13 @@ function validateConfig(cfg) {
     throw new Error("dup_name_strategy only supports suffix-ts-counter");
   }
 
+  if (!cfg.existing_file_strategy) {
+    cfg.existing_file_strategy = "overwrite";
+  }
+  if (!["session_merge", "overwrite"].includes(cfg.existing_file_strategy)) {
+    throw new Error("existing_file_strategy must be session_merge or overwrite");
+  }
+
   cfg.dest_dir = cfg.raw_dir;
 }
 
@@ -373,13 +380,12 @@ async function closeFile(fileState, msg) {
     throw new Error("file size mismatch");
   }
   const targetExists = await pathExists(fileState.targetPath);
-  const finalTargetPath = targetExists
-    ? await resolveFinalTargetPath(fileState.targetPath)
-    : fileState.targetPath;
-  await fs.promises.rename(fileState.tempPath, finalTargetPath);
-  if (!targetExists) {
+  if (!targetExists || config.existing_file_strategy === "overwrite") {
+    await fs.promises.rename(fileState.tempPath, fileState.targetPath);
     return;
   }
+  const finalTargetPath = await resolveFinalTargetPath(fileState.targetPath);
+  await fs.promises.rename(fileState.tempPath, finalTargetPath);
   const sessionId = extractSessionIdFromFileId(fileState.id);
   if (!sessionId) {
     return;

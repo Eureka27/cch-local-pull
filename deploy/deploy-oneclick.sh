@@ -5,16 +5,19 @@ set -euo pipefail
 DEPLOY_MODE="server"          # server | client
 DEPLOY_USER="ubuntu"          # systemd User=
 SERVER_HOST="0.0.0.0"
-SERVER_PORT="30511"
-SESSION_DIR="./session"
+SERVER_PORT="23050"
+SESSION_DIR="./export"
+SERVER_INCLUDE_EXTENSIONS='[".json",".jsonl"]'
+SERVER_EXCLUDE_PREFIXES='["state/"]'
 SERVER_AUTH_USER="pull"
 SERVER_AUTH_PASS="CHANGE_ME"
 
-CLIENT_SERVER_URL="ws://127.0.0.1:30511"
+CLIENT_SERVER_URL="ws://source.example.com:23050"
 CLIENT_AUTH_USER="pull"
 CLIENT_AUTH_PASS="CHANGE_ME"
-CLIENT_RAW_DIR="./cch-sessions/raw"
-CLIENT_REPORTS_DIR="./cch-sessions/reports"
+CLIENT_RAW_DIR="./pulled/export"
+CLIENT_REPORTS_DIR="./state/reports"
+CLIENT_EXISTING_FILE_STRATEGY="overwrite"
 # ================================================================
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -79,6 +82,9 @@ validate_config() {
   if [[ "${SERVER_AUTH_PASS}" == "CHANGE_ME" || "${CLIENT_AUTH_PASS}" == "CHANGE_ME" ]]; then
     fail "please replace CHANGE_ME with real auth password in script config"
   fi
+  if [[ "${CLIENT_EXISTING_FILE_STRATEGY}" != "overwrite" && "${CLIENT_EXISTING_FILE_STRATEGY}" != "session_merge" ]]; then
+    fail "CLIENT_EXISTING_FILE_STRATEGY must be overwrite or session_merge"
+  fi
 
   SESSION_DIR_ABS="$(resolve_path "${SESSION_DIR}")"
   CLIENT_RAW_DIR_ABS="$(resolve_path "${CLIENT_RAW_DIR}")"
@@ -93,6 +99,8 @@ write_server_config() {
   "host": "${SERVER_HOST}",
   "port": ${SERVER_PORT},
   "session_dir": "${SESSION_DIR_ABS}",
+  "include_extensions": ${SERVER_INCLUDE_EXTENSIONS},
+  "exclude_prefixes": ${SERVER_EXCLUDE_PREFIXES},
   "state_dir": "${REPO_ROOT}/state",
   "trash_dir": "${REPO_ROOT}/trash",
   "trash_ttl_days": 7,
@@ -124,6 +132,7 @@ write_client_config() {
   },
   "raw_dir": "${CLIENT_RAW_DIR_ABS}",
   "reports_dir": "${CLIENT_REPORTS_DIR_ABS}",
+  "existing_file_strategy": "${CLIENT_EXISTING_FILE_STRATEGY}",
   "dup_name_strategy": "suffix-ts-counter",
   "last_idx_path": "${REPO_ROOT}/state/last_idx.json",
   "pull_interval_seconds": 1200,

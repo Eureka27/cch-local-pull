@@ -234,6 +234,73 @@ function validateConfig(cfg) {
       cfg.deletions_log_cleanup_interval_seconds,
     );
   }
+  cfg.include_extensions = normalizeIncludeExtensions(cfg.include_extensions);
+  cfg.exclude_prefixes = normalizeExcludePrefixes(cfg.exclude_prefixes);
+}
+
+function normalizeIncludeExtensions(value) {
+  const defaults = [".json"];
+  if (!Array.isArray(value) || value.length === 0) {
+    return defaults;
+  }
+  const normalized = [];
+  const seen = new Set();
+  for (const item of value) {
+    if (typeof item !== "string") {
+      continue;
+    }
+    let ext = item.trim().toLowerCase();
+    if (!ext) {
+      continue;
+    }
+    if (!ext.startsWith(".")) {
+      ext = `.${ext}`;
+    }
+    if (seen.has(ext)) {
+      continue;
+    }
+    seen.add(ext);
+    normalized.push(ext);
+  }
+  return normalized.length > 0 ? normalized : defaults;
+}
+
+function normalizeExcludePrefixes(value) {
+  if (!Array.isArray(value) || value.length === 0) {
+    return [];
+  }
+  const normalized = [];
+  const seen = new Set();
+  for (const item of value) {
+    if (typeof item !== "string") {
+      continue;
+    }
+    let prefix = item.trim().replace(/\\/g, "/").replace(/^\/+/, "");
+    if (!prefix) {
+      continue;
+    }
+    if (seen.has(prefix)) {
+      continue;
+    }
+    seen.add(prefix);
+    normalized.push(prefix);
+  }
+  return normalized;
+}
+
+function shouldIncludeFile(fileId, cfg) {
+  const normalizedId = String(fileId || "").replace(/\\/g, "/");
+  if (!normalizedId) {
+    return false;
+  }
+  const lowerId = normalizedId.toLowerCase();
+  for (const prefix of cfg.exclude_prefixes) {
+    const lowerPrefix = prefix.toLowerCase();
+    if (lowerId === lowerPrefix || lowerId.startsWith(`${lowerPrefix}/`)) {
+      return false;
+    }
+  }
+  return cfg.include_extensions.some((ext) => lowerId.endsWith(ext));
 }
 
 function authenticate(request, auth) {
@@ -335,7 +402,7 @@ async function buildDelta(lastIdx, maxBatchBytes) {
 
   const previous = await readJson(snapshotPath, {});
   const files = (await listFiles(config.session_dir)).filter((file) =>
-    file.id.toLowerCase().endsWith(".json"),
+    shouldIncludeFile(file.id, config),
   );
 
   const current = {};

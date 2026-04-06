@@ -1,7 +1,9 @@
 {
   "host": "0.0.0.0",
   "port": 23050,
-  "session_dir": "/path/to/session",
+  "session_dir": "./export",
+  "include_extensions": [".json", ".jsonl"],
+  "exclude_prefixes": ["state/"],
   "state_dir": "./state",
   "trash_dir": "./trash",
   "trash_ttl_days": 7,
