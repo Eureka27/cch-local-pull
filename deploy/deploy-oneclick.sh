@@ -18,6 +18,9 @@ CLIENT_AUTH_PASS="CHANGE_ME"
 CLIENT_RAW_DIR="./pulled/export"
 CLIENT_REPORTS_DIR="./state/reports"
 CLIENT_EXISTING_FILE_STRATEGY="overwrite"
+CLIENT_PULL_INTERVAL_SECONDS="7200"
+CLIENT_EAGER_PULL_PENDING_BYTES="2147483648"
+CLIENT_EAGER_PULL_CHECK_INTERVAL_SECONDS="60"
 # ================================================================
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,6 +88,9 @@ validate_config() {
   if [[ "${CLIENT_EXISTING_FILE_STRATEGY}" != "overwrite" && "${CLIENT_EXISTING_FILE_STRATEGY}" != "session_merge" ]]; then
     fail "CLIENT_EXISTING_FILE_STRATEGY must be overwrite or session_merge"
   fi
+  [[ "${CLIENT_PULL_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]] || fail "CLIENT_PULL_INTERVAL_SECONDS must be an integer"
+  [[ "${CLIENT_EAGER_PULL_PENDING_BYTES}" =~ ^[0-9]+$ ]] || fail "CLIENT_EAGER_PULL_PENDING_BYTES must be an integer"
+  [[ "${CLIENT_EAGER_PULL_CHECK_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]] || fail "CLIENT_EAGER_PULL_CHECK_INTERVAL_SECONDS must be an integer"
 
   SESSION_DIR_ABS="$(resolve_path "${SESSION_DIR}")"
   CLIENT_RAW_DIR_ABS="$(resolve_path "${CLIENT_RAW_DIR}")"
@@ -135,7 +141,9 @@ write_client_config() {
   "existing_file_strategy": "${CLIENT_EXISTING_FILE_STRATEGY}",
   "dup_name_strategy": "suffix-ts-counter",
   "last_idx_path": "${REPO_ROOT}/state/last_idx.json",
-  "pull_interval_seconds": 1200,
+  "pull_interval_seconds": ${CLIENT_PULL_INTERVAL_SECONDS},
+  "eager_pull_pending_bytes": ${CLIENT_EAGER_PULL_PENDING_BYTES},
+  "eager_pull_check_interval_seconds": ${CLIENT_EAGER_PULL_CHECK_INTERVAL_SECONDS},
   "max_batch_bytes": 3221225472,
   "ack_timeout_seconds": 120
 }

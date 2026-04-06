@@ -9,7 +9,9 @@
   "existing_file_strategy": "overwrite",
   "dup_name_strategy": "suffix-ts-counter",
   "last_idx_path": "./state/last_idx.json",
-  "pull_interval_seconds": 1200,
+  "pull_interval_seconds": 7200,
+  "eager_pull_pending_bytes": 2147483648,
+  "eager_pull_check_interval_seconds": 60,
   "max_batch_bytes": 3221225472,
   "ack_timeout_seconds": 120
 }

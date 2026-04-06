@@ -11,11 +11,15 @@ const argv = process.argv.slice(2);
 const configPath = getArgValue(argv, "--config") || "config/client.json";
 const runOnce = argv.includes("--once");
 const config = loadConfig(configPath);
+const DEFAULT_PULL_INTERVAL_SECONDS = 7200;
+const DEFAULT_EAGER_PULL_PENDING_BYTES = 2 * 1024 * 1024 * 1024;
+const DEFAULT_EAGER_PULL_CHECK_INTERVAL_SECONDS = 60;
 
 validateConfig(config);
 
 const stateDir = path.resolve(process.cwd(), path.dirname(config.last_idx_path));
 let pulling = false;
+let probing = false;
 
 start();
 
@@ -30,12 +34,21 @@ async function start() {
     return;
   }
 
-  const intervalMs = (config.pull_interval_seconds || 1200) * 1000;
+  const intervalMs = config.pull_interval_seconds * 1000;
   setInterval(() => {
-    if (!pulling) {
+    if (!pulling && !probing) {
       pullOnce();
     }
   }, intervalMs);
+
+  if (config.eager_pull_pending_bytes > 0) {
+    const probeIntervalMs = config.eager_pull_check_interval_seconds * 1000;
+    setInterval(() => {
+      if (!pulling && !probing) {
+        probeAndPullIfNeeded();
+      }
+    }, probeIntervalMs);
+  }
 }
 
 async function pullOnce() {
@@ -47,6 +60,31 @@ async function pullOnce() {
     console.error("pull failed", err);
   } finally {
     pulling = false;
+  }
+}
+
+async function probeAndPullIfNeeded() {
+  if (pulling || probing) {
+    return;
+  }
+  probing = true;
+  try {
+    const lastIdx = normalizeIdx(await readJson(config.last_idx_path, null));
+    const summary = await probeDelta(lastIdx);
+    if (!summary) {
+      return;
+    }
+    if (summary.pending_bytes < config.eager_pull_pending_bytes) {
+      return;
+    }
+    console.log(
+      `[eager-pull] pending_bytes=${summary.pending_bytes} pending_files=${summary.pending_files} threshold=${config.eager_pull_pending_bytes}`,
+    );
+    await pullOnce();
+  } catch (err) {
+    console.error("eager pull probe failed", err);
+  } finally {
+    probing = false;
   }
 }
 
@@ -226,6 +264,59 @@ async function doPull(lastIdx) {
   });
 }
 
+async function probeDelta(lastIdx) {
+  return new Promise((resolve) => {
+    const authHeader = buildBasicAuth(config.auth.user, config.auth.pass);
+    const ws = new WebSocket(config.server_url, {
+      headers: {
+        Authorization: authHeader,
+      },
+    });
+
+    let resolved = false;
+
+    function finish(result) {
+      if (resolved) {
+        return;
+      }
+      resolved = true;
+      resolve(result);
+    }
+
+    ws.on("open", () => {
+      ws.send(
+        JSON.stringify({
+          type: "hello",
+          last_idx: lastIdx,
+          max_batch_bytes: config.max_batch_bytes,
+          summary_only: true,
+        }),
+      );
+    });
+
+    ws.on("message", (data, isBinary) => {
+      if (isBinary) {
+        return;
+      }
+      const msg = parseJsonMessage(data);
+      if (!msg || msg.type !== "delta_summary") {
+        return;
+      }
+      finish(msg);
+      ws.close();
+    });
+
+    ws.on("close", () => {
+      finish(null);
+    });
+
+    ws.on("error", (err) => {
+      console.error("ws probe error", err);
+      finish(null);
+    });
+  });
+}
+
 function validateConfig(cfg) {
   if (!cfg || typeof cfg !== "object") {
     throw new Error("Invalid config");
@@ -255,9 +346,31 @@ function validateConfig(cfg) {
     cfg.max_batch_bytes = Number(cfg.max_batch_bytes);
   }
   if (!cfg.pull_interval_seconds || Number(cfg.pull_interval_seconds) <= 0) {
-    cfg.pull_interval_seconds = 1200;
+    cfg.pull_interval_seconds = DEFAULT_PULL_INTERVAL_SECONDS;
   } else {
     cfg.pull_interval_seconds = Number(cfg.pull_interval_seconds);
+  }
+  if (cfg.eager_pull_pending_bytes == null || cfg.eager_pull_pending_bytes === "") {
+    cfg.eager_pull_pending_bytes = DEFAULT_EAGER_PULL_PENDING_BYTES;
+  } else {
+    cfg.eager_pull_pending_bytes = Number(cfg.eager_pull_pending_bytes);
+  }
+  if (Number.isNaN(cfg.eager_pull_pending_bytes) || cfg.eager_pull_pending_bytes < 0) {
+    throw new Error("eager_pull_pending_bytes must be a non-negative number");
+  }
+  if (
+    cfg.eager_pull_check_interval_seconds == null
+    || cfg.eager_pull_check_interval_seconds === ""
+  ) {
+    cfg.eager_pull_check_interval_seconds = DEFAULT_EAGER_PULL_CHECK_INTERVAL_SECONDS;
+  } else {
+    cfg.eager_pull_check_interval_seconds = Number(cfg.eager_pull_check_interval_seconds);
+  }
+  if (
+    Number.isNaN(cfg.eager_pull_check_interval_seconds)
+    || cfg.eager_pull_check_interval_seconds <= 0
+  ) {
+    throw new Error("eager_pull_check_interval_seconds must be a positive number");
   }
   if (!cfg.ack_timeout_seconds || Number(cfg.ack_timeout_seconds) <= 0) {
     cfg.ack_timeout_seconds = 120;

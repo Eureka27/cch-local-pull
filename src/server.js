@@ -86,6 +86,18 @@ wss.on("connection", (ws) => {
         : config.max_batch_bytes;
 
       const delta = await buildDelta(lastIdx, effectiveMax);
+      if (msg.summary_only) {
+        await sendJson(ws, {
+          type: "delta_summary",
+          next_idx: delta.next_idx,
+          truncated: delta.truncated,
+          pending_bytes: delta.pending_bytes,
+          pending_files: delta.pending_files,
+          pending_deletions: delta.pending_deletions,
+        });
+        ws.close();
+        return;
+      }
       const hasItems = Array.isArray(delta.items) && delta.items.length > 0;
       batchId = hasItems ? createBatchId() : null;
       sentItems = delta.items;
@@ -446,13 +458,29 @@ async function buildDelta(lastIdx, maxBatchBytes) {
   let totalBytes = 0;
   let nextIdx = normalizeIdx(lastIdx);
   let truncated = false;
+  let pendingBytes = 0;
+  let pendingFiles = 0;
+  let pendingDeletions = 0;
+  let batchFull = false;
 
   for (const event of events) {
+    if (event.type === "upsert") {
+      pendingBytes += event.file.size;
+      pendingFiles += 1;
+    } else {
+      pendingDeletions += 1;
+    }
+
+    if (batchFull) {
+      continue;
+    }
+
     if (event.type === "upsert") {
       const size = event.file.size;
       if (totalBytes > 0 && totalBytes + size > maxBatchBytes) {
         truncated = true;
-        break;
+        batchFull = true;
+        continue;
       }
       totalBytes += size;
       items.push({
@@ -479,6 +507,9 @@ async function buildDelta(lastIdx, maxBatchBytes) {
     deletions: deletionList,
     next_idx: nextIdx,
     truncated,
+    pending_bytes: pendingBytes,
+    pending_files: pendingFiles,
+    pending_deletions: pendingDeletions,
   };
 }
 

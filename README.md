@@ -6,6 +6,8 @@ Local pull toolkit for `claude-code-hub` exported data and flat session JSON fil
 - WebSocket server on the source host.
 - Incremental sync based on `mtimeMs + relative file id`.
 - Bidirectional delete sync.
+- Scheduled pull interval defaults to `2 hours`.
+- If pending source-side changes since the last acknowledged pull reach `2GiB`, the client probes and triggers an immediate pull without waiting for the full interval.
 - Batch size limit per pull (default `3GB`).
 - Configurable extension filter, for example `.json` and `.jsonl`.
 - Optional path-prefix exclusions, for example `state/`.
@@ -30,6 +32,9 @@ Important variables in `deploy/deploy-oneclick.sh`:
 - `CLIENT_RAW_DIR`
 - `CLIENT_REPORTS_DIR`
 - `CLIENT_EXISTING_FILE_STRATEGY`: `overwrite` or `session_merge`
+- `CLIENT_PULL_INTERVAL_SECONDS`: default `7200`
+- `CLIENT_EAGER_PULL_PENDING_BYTES`: default `2147483648` (`2GiB`)
+- `CLIENT_EAGER_PULL_CHECK_INTERVAL_SECONDS`: default `60`
 
 Relative paths in the script are resolved from the repository root.
 
@@ -92,7 +97,9 @@ Key fields in `config/client.json`:
 - `dup_name_strategy`: fixed as `suffix-ts-counter`
 - `auth.user` / `auth.pass`
 - `last_idx_path`
-- `pull_interval_seconds`
+- `pull_interval_seconds`: scheduled full-pull interval, default `7200`
+- `eager_pull_pending_bytes`: source-side pending-byte threshold for immediate pull, default `2147483648` (`2GiB`)
+- `eager_pull_check_interval_seconds`: summary probe interval, default `60`
 - `max_batch_bytes`
 - `ack_timeout_seconds`
 
@@ -101,7 +108,9 @@ Typical exporter-root client config:
 ```json
 {
   "raw_dir": "./pulled/export",
-  "existing_file_strategy": "overwrite"
+  "existing_file_strategy": "overwrite",
+  "pull_interval_seconds": 7200,
+  "eager_pull_pending_bytes": 2147483648
 }
 ```
 
@@ -121,6 +130,8 @@ Run once:
 ```bash
 node src/client.js --config config/client.json --once
 ```
+
+`eager_pull_pending_bytes` is based on pending source-side upsert bytes since the last acknowledged index, not on the total size of `raw_dir`.
 
 ## Dup Repair
 
