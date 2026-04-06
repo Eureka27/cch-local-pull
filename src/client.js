@@ -14,10 +14,12 @@ const config = loadConfig(configPath);
 const DEFAULT_PULL_INTERVAL_SECONDS = 7200;
 const DEFAULT_EAGER_PULL_PENDING_BYTES = 2 * 1024 * 1024 * 1024;
 const DEFAULT_EAGER_PULL_CHECK_INTERVAL_SECONDS = 60;
+const DEFAULT_JSONL_MERGE_STATE_PATH = "./state/jsonl_merge_state.json";
 
 validateConfig(config);
 
 const stateDir = path.resolve(process.cwd(), path.dirname(config.last_idx_path));
+const jsonlMergeState = { files: {} };
 let pulling = false;
 let probing = false;
 
@@ -27,6 +29,7 @@ async function start() {
   await ensureDir(config.raw_dir);
   await ensureDir(config.reports_dir);
   await ensureDir(stateDir);
+  await loadJsonlMergeState();
 
   await pullOnce();
 
@@ -340,6 +343,9 @@ function validateConfig(cfg) {
   if (!cfg.last_idx_path) {
     cfg.last_idx_path = "./state/last_idx.json";
   }
+  if (!cfg.jsonl_merge_state_path) {
+    cfg.jsonl_merge_state_path = DEFAULT_JSONL_MERGE_STATE_PATH;
+  }
   if (!cfg.max_batch_bytes || Number(cfg.max_batch_bytes) <= 0) {
     cfg.max_batch_bytes = 3221225472;
   } else {
@@ -387,10 +393,11 @@ function validateConfig(cfg) {
   if (!cfg.existing_file_strategy) {
     cfg.existing_file_strategy = "overwrite";
   }
-  if (!["session_merge", "overwrite"].includes(cfg.existing_file_strategy)) {
-    throw new Error("existing_file_strategy must be session_merge or overwrite");
+  if (!["session_merge", "overwrite", "jsonl_merge"].includes(cfg.existing_file_strategy)) {
+    throw new Error("existing_file_strategy must be session_merge, overwrite or jsonl_merge");
   }
   cfg.session_merge_prefixes = normalizeRelativeDirPrefixes(cfg.session_merge_prefixes);
+  cfg.jsonl_merge_prefixes = normalizeRelativeDirPrefixes(cfg.jsonl_merge_prefixes);
 
   cfg.dest_dir = cfg.raw_dir;
 }
@@ -467,6 +474,12 @@ function resolveWriteStrategy(fileId, cfg) {
       return "session_merge";
     }
   }
+  for (const prefix of cfg.jsonl_merge_prefixes) {
+    const lowerPrefix = prefix.toLowerCase();
+    if (lowerId.startsWith(lowerPrefix)) {
+      return "jsonl_merge";
+    }
+  }
   return cfg.existing_file_strategy;
 }
 
@@ -478,6 +491,7 @@ async function applyDeletion(id) {
   await safeUnlink(target);
   await removeSiblingDupFiles(target);
   await removeEmptyParents(path.dirname(target), config.raw_dir);
+  await clearJsonlMergeVersion(id);
 }
 
 async function removeSiblingDupFiles(targetPath) {
@@ -509,6 +523,7 @@ async function openFile(msg) {
   const sessionId = writeStrategy === "session_merge"
     ? extractSessionIdFromFileId(msg.id)
     : null;
+  const version = buildFileVersion(msg);
   await ensureDir(path.dirname(target));
   const tempPath = makeTempPath(target);
   const stream = fs.createWriteStream(tempPath, { flags: "w" });
@@ -521,6 +536,7 @@ async function openFile(msg) {
     targetPath: target,
     writeStrategy,
     sessionId,
+    version,
     stream,
   };
 }
@@ -542,8 +558,25 @@ async function closeFile(fileState, msg) {
     throw new Error("file size mismatch");
   }
   const targetExists = await pathExists(fileState.targetPath);
-  if (!targetExists || fileState.writeStrategy === "overwrite") {
+  if (!targetExists) {
     await fs.promises.rename(fileState.tempPath, fileState.targetPath);
+    if (fileState.writeStrategy === "jsonl_merge") {
+      await setJsonlMergeVersion(fileState.id, fileState.version);
+    }
+    return;
+  }
+  if (fileState.writeStrategy === "overwrite") {
+    await fs.promises.rename(fileState.tempPath, fileState.targetPath);
+    return;
+  }
+  if (fileState.writeStrategy === "jsonl_merge") {
+    if (targetExists && hasAppliedJsonlMergeVersion(fileState.id, fileState.version)) {
+      await safeUnlink(fileState.tempPath);
+      return;
+    }
+    await appendFileContents(fileState.targetPath, fileState.tempPath);
+    await safeUnlink(fileState.tempPath);
+    await setJsonlMergeVersion(fileState.id, fileState.version);
     return;
   }
   const finalTargetPath = await resolveFinalTargetPath(fileState.targetPath);
@@ -566,6 +599,51 @@ async function closeFile(fileState, msg) {
   } catch (err) {
     console.error(`[dup-rebuild] session=${sessionId} failed`, err);
   }
+}
+
+function buildFileVersion(msg) {
+  const mtimeMs = Number(msg && (msg.mtimeMs ?? (msg.idx && msg.idx.mtimeMs) ?? 0));
+  const size = Number(msg && typeof msg.size === "number" ? msg.size : 0);
+  return `${Number.isFinite(mtimeMs) ? mtimeMs : 0}:${Number.isFinite(size) ? size : 0}`;
+}
+
+async function loadJsonlMergeState() {
+  const loaded = await readJson(config.jsonl_merge_state_path, {});
+  const files = loaded && typeof loaded === "object" && !Array.isArray(loaded)
+    && loaded.files && typeof loaded.files === "object" && !Array.isArray(loaded.files)
+    ? loaded.files
+    : {};
+  jsonlMergeState.files = files;
+}
+
+function hasAppliedJsonlMergeVersion(fileId, version) {
+  return jsonlMergeState.files[fileId] === version;
+}
+
+async function setJsonlMergeVersion(fileId, version) {
+  jsonlMergeState.files[fileId] = version;
+  await writeJson(config.jsonl_merge_state_path, jsonlMergeState);
+}
+
+async function clearJsonlMergeVersion(fileId) {
+  if (!Object.prototype.hasOwnProperty.call(jsonlMergeState.files, fileId)) {
+    return;
+  }
+  delete jsonlMergeState.files[fileId];
+  await writeJson(config.jsonl_merge_state_path, jsonlMergeState);
+}
+
+async function appendFileContents(targetPath, sourcePath) {
+  await new Promise((resolve, reject) => {
+    const readStream = fs.createReadStream(sourcePath);
+    const writeStream = fs.createWriteStream(targetPath, { flags: "a" });
+
+    readStream.once("error", reject);
+    writeStream.once("error", reject);
+    writeStream.once("finish", resolve);
+
+    readStream.pipe(writeStream);
+  });
 }
 
 async function resolveFinalTargetPath(targetPath) {

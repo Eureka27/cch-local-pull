@@ -11,10 +11,11 @@ Local pull toolkit for `claude-code-hub` exported data and flat session JSON fil
 - Batch size limit per pull (default `3GB`).
 - Configurable extension filter, for example `.json` and `.jsonl`.
 - Optional path-prefix exclusions, for example `state/`.
-- Two collision strategies on the client:
+- Three write strategies on the client:
   - `overwrite`: replace the local file with the source file. This is the default and the recommended mode for exporter roots such as `./export`.
   - `session_merge`: keep duplicate session JSON files, rebuild a canonical `<session_id>.json`, and write a report when a rebuild happens.
-- Path-based `session_merge` overrides are supported, so one subtree such as `redis/session_events/` can use merge while everything else stays on `overwrite`.
+  - `jsonl_merge`: append new source file versions to the local target file while skipping re-appends of the same source file version.
+- Path-based overrides are supported, so one subtree such as `redis/session_events/` can use `session_merge`, while `redis/request_sidecars/` and `db/` use `jsonl_merge`.
 
 ## One-click Deploy
 
@@ -32,8 +33,9 @@ Important variables in `deploy/deploy-oneclick.sh`:
 - `CLIENT_SERVER_URL`
 - `CLIENT_RAW_DIR`
 - `CLIENT_REPORTS_DIR`
-- `CLIENT_EXISTING_FILE_STRATEGY`: `overwrite` or `session_merge`
+- `CLIENT_EXISTING_FILE_STRATEGY`: `overwrite`, `session_merge` or `jsonl_merge`
 - `CLIENT_SESSION_MERGE_PREFIXES`: default `["redis/session_events/"]`
+- `CLIENT_JSONL_MERGE_PREFIXES`: default `["redis/request_sidecars/","db/"]`
 - `CLIENT_PULL_INTERVAL_SECONDS`: default `7200`
 - `CLIENT_EAGER_PULL_PENDING_BYTES`: default `2147483648` (`2GiB`)
 - `CLIENT_EAGER_PULL_CHECK_INTERVAL_SECONDS`: default `60`
@@ -95,11 +97,13 @@ Key fields in `config/client.json`:
 - `server_url`: for example `ws://source.example.com:23050`
 - `raw_dir`: local destination root for pulled files
 - `reports_dir`: report directory used by `session_merge`
-- `existing_file_strategy`: `overwrite` or `session_merge`
+- `existing_file_strategy`: `overwrite`, `session_merge` or `jsonl_merge`
 - `session_merge_prefixes`: relative directory prefixes that force `session_merge`, for example `["redis/session_events/"]`
+- `jsonl_merge_prefixes`: relative directory prefixes that force `jsonl_merge`, for example `["redis/request_sidecars/", "db/"]`
 - `dup_name_strategy`: fixed as `suffix-ts-counter`
 - `auth.user` / `auth.pass`
 - `last_idx_path`
+- `jsonl_merge_state_path`: local state file used to avoid re-appending the same source file version
 - `pull_interval_seconds`: scheduled full-pull interval, default `7200`
 - `eager_pull_pending_bytes`: source-side pending-byte threshold for immediate pull, default `2147483648` (`2GiB`)
 - `eager_pull_check_interval_seconds`: summary probe interval, default `60`
@@ -113,6 +117,7 @@ Typical exporter-root client config:
   "raw_dir": "./pulled/export",
   "existing_file_strategy": "overwrite",
   "session_merge_prefixes": ["redis/session_events/"],
+  "jsonl_merge_prefixes": ["redis/request_sidecars/", "db/"],
   "pull_interval_seconds": 7200,
   "eager_pull_pending_bytes": 2147483648
 }
@@ -120,8 +125,8 @@ Typical exporter-root client config:
 
 In exporter-root mode, a practical setup is:
 - `redis/session_events/` uses `session_merge`
-- `redis/request_sidecars/` uses `overwrite`
-- `db/` uses `overwrite`
+- `redis/request_sidecars/` uses `jsonl_merge`
+- `db/` uses `jsonl_merge`
 
 If the source side is a flat per-session JSON directory, you can still set `existing_file_strategy` to `session_merge` for the whole pull root and omit `session_merge_prefixes`.
 
@@ -141,6 +146,20 @@ node src/client.js --config config/client.json --once
 ```
 
 `eager_pull_pending_bytes` is based on pending source-side upsert bytes since the last acknowledged index, not on the total size of `raw_dir`.
+
+## Write Strategies
+
+- `overwrite`
+  - What it does: replace the local file with the latest source file.
+  - Use it for: files that should always be treated as complete latest snapshots.
+
+- `session_merge`
+  - What it does: keep duplicate session JSON files temporarily, then rebuild one canonical `<session_id>.json`.
+  - Use it for: session event streams where the same session file may be pulled multiple times and should be merged back into one timeline, such as `redis/session_events/`, or a flat per-session JSON directory.
+
+- `jsonl_merge`
+  - What it does: append each new source file version to the local target file and skip re-appending the same source file version on retry.
+  - Use it for: append-only exporter files that should keep full history across pulls, such as `db/` daily JSONL files and `redis/request_sidecars/`.
 
 ## Dup Repair
 

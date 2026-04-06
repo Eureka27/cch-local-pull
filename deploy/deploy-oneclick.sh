@@ -19,6 +19,7 @@ CLIENT_RAW_DIR="./pulled/export"
 CLIENT_REPORTS_DIR="./state/reports"
 CLIENT_EXISTING_FILE_STRATEGY="overwrite"
 CLIENT_SESSION_MERGE_PREFIXES='["redis/session_events/"]'
+CLIENT_JSONL_MERGE_PREFIXES='["redis/request_sidecars/","db/"]'
 CLIENT_PULL_INTERVAL_SECONDS="7200"
 CLIENT_EAGER_PULL_PENDING_BYTES="2147483648"
 CLIENT_EAGER_PULL_CHECK_INTERVAL_SECONDS="60"
@@ -86,8 +87,8 @@ validate_config() {
   if [[ "${SERVER_AUTH_PASS}" == "CHANGE_ME" || "${CLIENT_AUTH_PASS}" == "CHANGE_ME" ]]; then
     fail "please replace CHANGE_ME with real auth password in script config"
   fi
-  if [[ "${CLIENT_EXISTING_FILE_STRATEGY}" != "overwrite" && "${CLIENT_EXISTING_FILE_STRATEGY}" != "session_merge" ]]; then
-    fail "CLIENT_EXISTING_FILE_STRATEGY must be overwrite or session_merge"
+  if [[ "${CLIENT_EXISTING_FILE_STRATEGY}" != "overwrite" && "${CLIENT_EXISTING_FILE_STRATEGY}" != "session_merge" && "${CLIENT_EXISTING_FILE_STRATEGY}" != "jsonl_merge" ]]; then
+    fail "CLIENT_EXISTING_FILE_STRATEGY must be overwrite, session_merge or jsonl_merge"
   fi
   [[ "${CLIENT_PULL_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]] || fail "CLIENT_PULL_INTERVAL_SECONDS must be an integer"
   [[ "${CLIENT_EAGER_PULL_PENDING_BYTES}" =~ ^[0-9]+$ ]] || fail "CLIENT_EAGER_PULL_PENDING_BYTES must be an integer"
@@ -141,8 +142,10 @@ write_client_config() {
   "reports_dir": "${CLIENT_REPORTS_DIR_ABS}",
   "existing_file_strategy": "${CLIENT_EXISTING_FILE_STRATEGY}",
   "session_merge_prefixes": ${CLIENT_SESSION_MERGE_PREFIXES},
+  "jsonl_merge_prefixes": ${CLIENT_JSONL_MERGE_PREFIXES},
   "dup_name_strategy": "suffix-ts-counter",
   "last_idx_path": "${REPO_ROOT}/state/last_idx.json",
+  "jsonl_merge_state_path": "${REPO_ROOT}/state/jsonl_merge_state.json",
   "pull_interval_seconds": ${CLIENT_PULL_INTERVAL_SECONDS},
   "eager_pull_pending_bytes": ${CLIENT_EAGER_PULL_PENDING_BYTES},
   "eager_pull_check_interval_seconds": ${CLIENT_EAGER_PULL_CHECK_INTERVAL_SECONDS},
