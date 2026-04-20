@@ -5,7 +5,11 @@ const WebSocket = require("ws");
 const { loadConfig, getArgValue } = require("./shared/config");
 const { ensureDir, readJson, writeJson, safeJoin } = require("./shared/fs");
 const { normalizeIdx } = require("./shared/idx");
-const { rebuildSessionFromDup } = require("./shared/session_merge");
+const {
+  cleanupManagedTmpSiblingsForBasePath,
+  cleanupManagedTmpTree,
+  rebuildSessionFromDup,
+} = require("./shared/session_merge");
 
 const argv = process.argv.slice(2);
 const configPath = getArgValue(argv, "--config") || "config/client.json";
@@ -29,6 +33,7 @@ async function start() {
   await ensureDir(config.raw_dir);
   await ensureDir(config.reports_dir);
   await ensureDir(stateDir);
+  await cleanupStartupManagedTmpFiles();
   await loadJsonlMergeState();
 
   await pullOnce();
@@ -598,7 +603,9 @@ async function closeFile(fileState, msg) {
     );
   } catch (err) {
     console.error(`[dup-rebuild] session=${sessionId} failed`, err);
+    return;
   }
+  await cleanupSessionManagedTmpFiles(sessionId, fileState.targetPath);
 }
 
 function buildFileVersion(msg) {
@@ -688,6 +695,51 @@ async function safeUnlink(filePath) {
   } catch (err) {
     return;
   }
+}
+
+async function cleanupStartupManagedTmpFiles() {
+  const roots = Array.from(
+    new Set([path.resolve(config.raw_dir), path.resolve(config.reports_dir)]),
+  );
+  for (const root of roots) {
+    const summary = await cleanupManagedTmpTree(root, {
+      removeEmptyParents,
+    });
+    if (summary.matched === 0 && summary.failed === 0) {
+      continue;
+    }
+    console.log(
+      `[tmp-cleanup-startup] root=${root} matched=${summary.matched} removed=${summary.removed} skipped_active_pid=${summary.skipped_active_pid} failed=${summary.failed}`,
+    );
+  }
+}
+
+async function cleanupSessionManagedTmpFiles(sessionId, targetPath) {
+  const basePaths = [
+    targetPath,
+    safeJoin(config.reports_dir, `${sessionId}.json`),
+  ];
+  const total = {
+    matched: 0,
+    removed: 0,
+    skipped_active_pid: 0,
+    failed: 0,
+  };
+  for (const basePath of basePaths) {
+    const summary = await cleanupManagedTmpSiblingsForBasePath(basePath, {
+      removeEmptyParents,
+    });
+    total.matched += summary.matched;
+    total.removed += summary.removed;
+    total.skipped_active_pid += summary.skipped_active_pid;
+    total.failed += summary.failed;
+  }
+  if (total.matched === 0 && total.failed === 0) {
+    return;
+  }
+  console.log(
+    `[tmp-cleanup-session] session=${sessionId} matched=${total.matched} removed=${total.removed} skipped_active_pid=${total.skipped_active_pid} failed=${total.failed}`,
+  );
 }
 
 async function removeEmptyParents(startDir, rootDir) {

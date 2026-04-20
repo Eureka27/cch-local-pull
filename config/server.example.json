@@ -7,8 +7,8 @@
   "state_dir": "./state",
   "trash_dir": "./trash",
   "trash_ttl_days": 7,
-  "trash_cleanup_interval_seconds": 600,
-  "trash_max_bytes": 5368709120,
+  "trash_cleanup_interval_seconds": 60,
+  "trash_max_bytes": 3221225472,
   "auth": {
     "user": "pull",
     "pass": "CHANGE_ME"

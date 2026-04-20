@@ -1,23 +1,201 @@
 # cch-local-pull
 
-Local pull toolkit for `claude-code-hub` exported data and flat session JSON files. It syncs files incrementally over WebSocket with Basic Auth.
+`cch-local-pull` transfers exported session and database files from a source host to a data host over WebSocket with Basic Auth. It supports incremental sync, delete propagation, path-based write strategies, and source-side trash management for acknowledged files.
 
-## Features
-- WebSocket server on the source host.
-- Incremental sync based on `mtimeMs + relative file id`.
-- Bidirectional delete sync.
-- Scheduled pull interval defaults to `2 hours`.
-- If pending source-side changes since the last acknowledged pull reach `2GiB`, the client probes and triggers an immediate pull without waiting for the full interval.
-- Batch size limit per pull (default `3GB`).
-- Configurable extension filter, for example `.json` and `.jsonl`.
-- Optional path-prefix exclusions, for example `state/`.
-- Three write strategies on the client:
-  - `overwrite`: replace the local file with the source file. This is the default and the recommended mode for exporter roots such as `./export`.
-  - `session_merge`: keep duplicate session JSON files, rebuild a canonical `<session_id>.json`, and write a report when a rebuild happens.
-  - `jsonl_merge`: append new source file versions to the local target file while skipping re-appends of the same source file version.
-- Path-based overrides are supported, so one subtree such as `redis/session_events/` can use `session_merge`, while `redis/request_sidecars/` and `db/` use `jsonl_merge`.
+## Overview
 
-## One-click Deploy
+- A source server exposes a pull endpoint over WebSocket.
+- A pull client connects to the source server and fetches file deltas.
+- File updates are tracked by `mtimeMs + relative file id`.
+- Delete events are propagated to the client.
+- Source files that have been acknowledged by the client are moved into `trash`.
+
+## Server Behavior
+
+The source server reads files from `session_dir` and serves matching files to authenticated clients.
+
+Key characteristics:
+
+- Supported extensions are configurable, for example `.json` and `.jsonl`.
+- Excluded prefixes are configurable, for example `state/`.
+- Acknowledged source files are moved into `trash`.
+- Trash cleanup runs as a background task.
+- The default trash cleanup interval is `60` seconds.
+- The default trash size cap is `3221225472` bytes (`3 GiB`).
+- If trash grows beyond the configured cap, a full trash cleanup may be used as the final fallback.
+- Under `trash/db/...`, only the latest file for each logical path is retained.
+- Historical `trash/db/*.dup-*` files are pruned during cleanup.
+- Non-`db` paths keep their existing duplicate naming behavior.
+
+## Client Behavior
+
+The pull client stores files under `raw_dir` and applies a write strategy based on path rules.
+
+Key characteristics:
+
+- The default scheduled pull interval is `7200` seconds.
+- The client can probe pending source-side bytes and trigger an earlier pull when the configured threshold is reached.
+- Pull batches are limited by `max_batch_bytes`.
+- The client tracks the last acknowledged index in `last_idx_path`.
+- `jsonl_merge` tracks already applied source versions in `jsonl_merge_state_path`.
+- Startup cleanup removes orphaned managed `*.tmp-*` files that belong to dead processes.
+- Successful session rebuilds also clean managed `tmp` files for the rebuilt session and its report.
+
+## Write Strategies
+
+### `overwrite`
+
+Use `overwrite` for paths that should always be treated as complete latest snapshots.
+
+Behavior:
+
+- If the target file does not exist, the client stores the incoming file directly.
+- If the target file already exists, the incoming file replaces it.
+
+### `session_merge`
+
+Use `session_merge` for session event streams where the same logical session may be pulled multiple times and needs to be rebuilt into one canonical file.
+
+Behavior:
+
+- The first pulled file is stored directly as `<session_id>.json`.
+- Later versions of the same session are stored as temporary duplicate inputs.
+- The client rebuilds one canonical `<session_id>.json`.
+- The rebuild uses:
+  - dedupe key: `requestSequence + type + payload`
+  - conflict key: `requestSequence + type`
+  - newer source wins on conflicts
+- Duplicate input files are removed after a successful rebuild.
+- A per-session report is written under `reports_dir`.
+
+### `jsonl_merge`
+
+Use `jsonl_merge` for append-only exporter outputs such as:
+
+- `db/`
+- `redis/request_sidecars/`
+
+Behavior:
+
+- Each new source file version is appended to the local target file.
+- The same source version is not appended twice on retry.
+
+## Example Layout
+
+Typical exporter-root layout on the source side:
+
+```text
+export/
+  redis/
+    session_events/
+    request_sidecars/
+  db/
+```
+
+Typical client layout:
+
+```text
+pulled/
+  export/
+state/
+  last_idx.json
+  jsonl_merge_state.json
+  reports/
+trash/
+```
+
+## Configuration
+
+### Server
+
+Example:
+
+```json
+{
+  "host": "0.0.0.0",
+  "port": 23050,
+  "session_dir": "./export",
+  "include_extensions": [".json", ".jsonl"],
+  "exclude_prefixes": ["state/"],
+  "state_dir": "./state",
+  "trash_dir": "./trash",
+  "trash_ttl_days": 7,
+  "trash_cleanup_interval_seconds": 60,
+  "trash_max_bytes": 3221225472,
+  "auth": {
+    "user": "pull",
+    "pass": "CHANGE_ME"
+  },
+  "max_batch_bytes": 3221225472,
+  "chunk_bytes": 1048576,
+  "ack_timeout_seconds": 120,
+  "deletions_log_max_lines": 200000,
+  "deletions_log_cleanup_interval_seconds": 600
+}
+```
+
+Important fields:
+
+- `session_dir`
+- `include_extensions`
+- `exclude_prefixes`
+- `state_dir`
+- `trash_dir`
+- `trash_ttl_days`
+- `trash_cleanup_interval_seconds`
+- `trash_max_bytes`
+- `auth.user`
+- `auth.pass`
+- `max_batch_bytes`
+- `chunk_bytes`
+- `ack_timeout_seconds`
+
+### Client
+
+Example:
+
+```json
+{
+  "server_url": "ws://source.example.com:23050",
+  "auth": {
+    "user": "pull",
+    "pass": "CHANGE_ME"
+  },
+  "raw_dir": "./pulled/export",
+  "reports_dir": "./state/reports",
+  "existing_file_strategy": "overwrite",
+  "session_merge_prefixes": ["redis/session_events/"],
+  "jsonl_merge_prefixes": ["redis/request_sidecars/", "db/"],
+  "dup_name_strategy": "suffix-ts-counter",
+  "last_idx_path": "./state/last_idx.json",
+  "jsonl_merge_state_path": "./state/jsonl_merge_state.json",
+  "pull_interval_seconds": 7200,
+  "eager_pull_pending_bytes": 2147483648,
+  "eager_pull_check_interval_seconds": 60,
+  "max_batch_bytes": 3221225472,
+  "ack_timeout_seconds": 120
+}
+```
+
+Important fields:
+
+- `server_url`
+- `auth.user`
+- `auth.pass`
+- `raw_dir`
+- `reports_dir`
+- `existing_file_strategy`
+- `session_merge_prefixes`
+- `jsonl_merge_prefixes`
+- `last_idx_path`
+- `jsonl_merge_state_path`
+- `pull_interval_seconds`
+- `eager_pull_pending_bytes`
+- `eager_pull_check_interval_seconds`
+- `max_batch_bytes`
+- `ack_timeout_seconds`
+
+## One-Click Deploy
 
 Edit the variables at the top of `deploy/deploy-oneclick.sh`, then run:
 
@@ -25,113 +203,36 @@ Edit the variables at the top of `deploy/deploy-oneclick.sh`, then run:
 bash deploy/deploy-oneclick.sh
 ```
 
-Important variables in `deploy/deploy-oneclick.sh`:
-- `DEPLOY_MODE`: `server` or `client`
-- `SESSION_DIR`: source root such as `./export` or `./session`
-- `SERVER_INCLUDE_EXTENSIONS`: for example `[".json",".jsonl"]`
-- `SERVER_EXCLUDE_PREFIXES`: for example `["state/"]`
+Common variables:
+
+- `DEPLOY_MODE`
+- `SESSION_DIR`
+- `SERVER_INCLUDE_EXTENSIONS`
+- `SERVER_EXCLUDE_PREFIXES`
 - `CLIENT_SERVER_URL`
 - `CLIENT_RAW_DIR`
 - `CLIENT_REPORTS_DIR`
-- `CLIENT_EXISTING_FILE_STRATEGY`: `overwrite`, `session_merge` or `jsonl_merge`
-- `CLIENT_SESSION_MERGE_PREFIXES`: default `["redis/session_events/"]`
-- `CLIENT_JSONL_MERGE_PREFIXES`: default `["redis/request_sidecars/","db/"]`
-- `CLIENT_PULL_INTERVAL_SECONDS`: default `7200`
-- `CLIENT_EAGER_PULL_PENDING_BYTES`: default `2147483648` (`2GiB`)
-- `CLIENT_EAGER_PULL_CHECK_INTERVAL_SECONDS`: default `60`
+- `CLIENT_EXISTING_FILE_STRATEGY`
+- `CLIENT_SESSION_MERGE_PREFIXES`
+- `CLIENT_JSONL_MERGE_PREFIXES`
+- `CLIENT_PULL_INTERVAL_SECONDS`
+- `CLIENT_EAGER_PULL_PENDING_BYTES`
+- `CLIENT_EAGER_PULL_CHECK_INTERVAL_SECONDS`
 
-Relative paths in the script are resolved from the repository root.
+## Manual Start
 
-## Source Server
-
-Install and prepare config:
+Install dependencies:
 
 ```bash
 cd /path/to/cch-local-pull
 npm install
-cp config/server.example.json config/server.json
-```
-
-Key fields in `config/server.json`:
-- `session_dir`: source root. It can be a flat session directory such as `./session` or an exporter root such as `./export`.
-- `include_extensions`: allowed file extensions.
-- `exclude_prefixes`: excluded relative prefixes inside `session_dir`.
-- `auth.user` / `auth.pass`
-- `port`
-- `state_dir`
-- `trash_dir`
-- `trash_ttl_days`
-- `trash_cleanup_interval_seconds`
-- `trash_max_bytes`
-- `ack_timeout_seconds`
-- `deletions_log_max_lines`
-- `deletions_log_cleanup_interval_seconds`
-
-Typical exporter-root server config:
-
-```json
-{
-  "session_dir": "./export",
-  "include_extensions": [".json", ".jsonl"],
-  "exclude_prefixes": ["state/"]
-}
 ```
 
 Start the server:
 
 ```bash
-npm run server
+node src/server.js --config config/server.json
 ```
-
-## Pull Client
-
-Install and prepare config:
-
-```bash
-cd /path/to/cch-local-pull
-npm install
-cp config/client.example.json config/client.json
-```
-
-Key fields in `config/client.json`:
-- `server_url`: for example `ws://source.example.com:23050`
-- `raw_dir`: local destination root for pulled files
-- `reports_dir`: report directory used by `session_merge`
-- `existing_file_strategy`: `overwrite`, `session_merge` or `jsonl_merge`
-- `session_merge_prefixes`: relative directory prefixes that force `session_merge`, for example `["redis/session_events/"]`
-- `jsonl_merge_prefixes`: relative directory prefixes that force `jsonl_merge`, for example `["redis/request_sidecars/", "db/"]`
-- `dup_name_strategy`: fixed as `suffix-ts-counter`
-- `auth.user` / `auth.pass`
-- `last_idx_path`
-- `jsonl_merge_state_path`: local state file used to avoid re-appending the same source file version
-- `pull_interval_seconds`: scheduled full-pull interval, default `7200`
-- `eager_pull_pending_bytes`: source-side pending-byte threshold for immediate pull, default `2147483648` (`2GiB`)
-- `eager_pull_check_interval_seconds`: summary probe interval, default `60`
-- `max_batch_bytes`
-- `ack_timeout_seconds`
-
-Typical exporter-root client config:
-
-```json
-{
-  "raw_dir": "./pulled/export",
-  "existing_file_strategy": "overwrite",
-  "session_merge_prefixes": ["redis/session_events/"],
-  "jsonl_merge_prefixes": ["redis/request_sidecars/", "db/"],
-  "pull_interval_seconds": 7200,
-  "eager_pull_pending_bytes": 2147483648
-}
-```
-
-In exporter-root mode, a practical setup is:
-- `redis/session_events/` uses `session_merge`
-- `redis/request_sidecars/` uses `jsonl_merge`
-- `db/` uses `jsonl_merge`
-
-If the source side is a flat per-session JSON directory, you can still set `existing_file_strategy` to `session_merge` for the whole pull root and omit `session_merge_prefixes`.
-
-Compatibility note:
-- Legacy `dest_dir` is still accepted and treated as `raw_dir` when `raw_dir` is not provided.
 
 Start the client:
 
@@ -139,55 +240,26 @@ Start the client:
 node src/client.js --config config/client.json
 ```
 
-Run once:
+Run the client once:
 
 ```bash
 node src/client.js --config config/client.json --once
 ```
 
-`eager_pull_pending_bytes` is based on pending source-side upsert bytes since the last acknowledged index, not on the total size of `raw_dir`.
+## Systemd
 
-## Write Strategies
+Example unit files:
 
-- `overwrite`
-  - What it does: replace the local file with the latest source file.
-  - Use it for: files that should always be treated as complete latest snapshots.
-
-- `session_merge`
-  - What it does: keep duplicate session JSON files temporarily, then rebuild one canonical `<session_id>.json`.
-  - Use it for: session event streams where the same session file may be pulled multiple times and should be merged back into one timeline, such as `redis/session_events/`, or a flat per-session JSON directory.
-
-- `jsonl_merge`
-  - What it does: append each new source file version to the local target file and skip re-appending the same source file version on retry.
-  - Use it for: append-only exporter files that should keep full history across pulls, such as `db/` daily JSONL files and `redis/request_sidecars/`.
-
-## Dup Repair
-
-`session_merge` rebuilds files with these rules:
-- Dedupe key: `requestSequence + type + payload`
-- Conflict key: `requestSequence + type`, newer source wins
-- Duplicate inputs are written as `.dup-*` files before rebuild
-- Reports are written only when rebuild is triggered
-
-## Deploy
-
-Example units:
 - `deploy/cch-pull-server.service.example`
 - `deploy/cch-pull-client.service.example`
 
-Install the source server unit:
+Install example units:
 
 ```bash
 sudo cp deploy/cch-pull-server.service.example /etc/systemd/system/cch-pull-server.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now cch-pull-server.service
-```
-
-Install the pull client unit:
-
-```bash
 sudo cp deploy/cch-pull-client.service.example /etc/systemd/system/cch-pull-client.service
 sudo systemctl daemon-reload
+sudo systemctl enable --now cch-pull-server.service
 sudo systemctl enable --now cch-pull-client.service
 ```
 

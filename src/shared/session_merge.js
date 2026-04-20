@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 
 const { ensureDir, safeJoin } = require("./fs");
+const TMP_FILE_NAME_RE = /^(.*)\.tmp-(\d+)-(\d+)(?:-([0-9a-f]+))?$/i;
 
 async function rebuildSessionFromDup(options) {
   const {
@@ -282,8 +283,17 @@ function renderJsonl(events) {
 async function writeTextAtomic(filePath, text) {
   await ensureDir(path.dirname(filePath));
   const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  await fs.promises.writeFile(tempPath, text, "utf8");
-  await fs.promises.rename(tempPath, filePath);
+  try {
+    await fs.promises.writeFile(tempPath, text, "utf8");
+    await fs.promises.rename(tempPath, filePath);
+  } catch (err) {
+    try {
+      await fs.promises.unlink(tempPath);
+    } catch (unlinkErr) {
+      // Ignore cleanup failure and preserve the original error.
+    }
+    throw err;
+  }
 }
 
 async function writeDupReport(reportsDir, report) {
@@ -305,6 +315,110 @@ function isDupFileName(fileName) {
   return String(fileName || "").toLowerCase().includes(".json.dup-");
 }
 
+function parseManagedTmpFileName(fileName) {
+  const match = TMP_FILE_NAME_RE.exec(String(fileName || ""));
+  if (!match) {
+    return null;
+  }
+  const baseName = match[1];
+  const lowerBaseName = baseName.toLowerCase();
+  if (!lowerBaseName.endsWith(".json") && !lowerBaseName.endsWith(".jsonl")) {
+    return null;
+  }
+  const pid = Number(match[2]);
+  const createdAtMs = Number(match[3]);
+  if (!Number.isInteger(pid) || pid <= 0 || !Number.isFinite(createdAtMs) || createdAtMs <= 0) {
+    return null;
+  }
+  return {
+    baseName,
+    pid,
+    createdAtMs,
+    entropy: match[4] || null,
+  };
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    if (err && err.code === "ESRCH") {
+      return false;
+    }
+    return true;
+  }
+}
+
+async function cleanupManagedTmpTree(rootDir, options = {}) {
+  const root = path.resolve(rootDir);
+  const recursive = options.recursive !== false;
+  const baseName = typeof options.baseName === "string" && options.baseName
+    ? options.baseName
+    : null;
+  const skipActive = options.skipActive !== false;
+  const removeParents = typeof options.removeEmptyParents === "function"
+    ? options.removeEmptyParents
+    : null;
+  const summary = {
+    matched: 0,
+    removed: 0,
+    skipped_active_pid: 0,
+    failed: 0,
+  };
+
+  async function walk(currentDir) {
+    const entries = await safeReadDir(currentDir);
+    for (const entry of entries) {
+      const absPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        if (recursive) {
+          await walk(absPath);
+        }
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+      const parsed = parseManagedTmpFileName(entry.name);
+      if (!parsed) {
+        continue;
+      }
+      if (baseName && parsed.baseName !== baseName) {
+        continue;
+      }
+      summary.matched += 1;
+      if (skipActive && isProcessAlive(parsed.pid)) {
+        summary.skipped_active_pid += 1;
+        continue;
+      }
+      try {
+        await fs.promises.unlink(absPath);
+        if (removeParents) {
+          await removeParents(path.dirname(absPath), root);
+        }
+        summary.removed += 1;
+      } catch (err) {
+        summary.failed += 1;
+      }
+    }
+  }
+
+  await walk(root);
+  return summary;
+}
+
+async function cleanupManagedTmpSiblingsForBasePath(basePath, options = {}) {
+  return cleanupManagedTmpTree(path.dirname(basePath), {
+    ...options,
+    recursive: false,
+    baseName: path.basename(basePath),
+  });
+}
+
 async function safeReadDir(dirPath) {
   try {
     return await fs.promises.readdir(dirPath, { withFileTypes: true });
@@ -322,5 +436,8 @@ async function safeStat(filePath) {
 }
 
 module.exports = {
+  cleanupManagedTmpSiblingsForBasePath,
+  cleanupManagedTmpTree,
+  parseManagedTmpFileName,
   rebuildSessionFromDup,
 };

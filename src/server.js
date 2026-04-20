@@ -8,6 +8,9 @@ const { loadConfig, getArgValue } = require("./shared/config");
 const { ensureDir, readJson, writeJson, safeJoin } = require("./shared/fs");
 const { listFiles } = require("./shared/scan");
 const { normalizeIdx, compareIdx, isAfter } = require("./shared/idx");
+const DEFAULT_TRASH_MAX_BYTES = 3 * 1024 * 1024 * 1024;
+const DEFAULT_TRASH_CLEANUP_INTERVAL_SECONDS = 60;
+const TRASH_DUP_SUFFIX_RE = /^(.*)\.dup-(\d+)-(\d+)$/i;
 
 const argv = process.argv.slice(2);
 const configPath = getArgValue(argv, "--config") || "config/server.json";
@@ -28,6 +31,7 @@ const deletionsLogCleanupIntervalMs =
 let lastTrashCleanupAt = 0;
 let lastDeletionsCleanupAt = 0;
 let deletionsFileQueue = Promise.resolve();
+let trashCleanupPromise = null;
 
 const server = http.createServer();
 const wss = new WebSocketServer({ noServer: true });
@@ -177,6 +181,10 @@ wss.on("connection", (ws) => {
 
 server.listen(config.port, config.host, () => {
   console.log(`ws server listening on ${config.host}:${config.port}`);
+  scheduleTrashCleanup();
+  runTrashCleanup("startup", { force: true }).catch((err) => {
+    console.error("startup trash cleanup failed", err);
+  });
 });
 
 function validateConfig(cfg) {
@@ -222,12 +230,12 @@ function validateConfig(cfg) {
     !cfg.trash_cleanup_interval_seconds
     || Number(cfg.trash_cleanup_interval_seconds) <= 0
   ) {
-    cfg.trash_cleanup_interval_seconds = 600;
+    cfg.trash_cleanup_interval_seconds = DEFAULT_TRASH_CLEANUP_INTERVAL_SECONDS;
   } else {
     cfg.trash_cleanup_interval_seconds = Number(cfg.trash_cleanup_interval_seconds);
   }
   if (!cfg.trash_max_bytes || Number(cfg.trash_max_bytes) <= 0) {
-    cfg.trash_max_bytes = 5 * 1024 * 1024 * 1024;
+    cfg.trash_max_bytes = DEFAULT_TRASH_MAX_BYTES;
   } else {
     cfg.trash_max_bytes = Number(cfg.trash_max_bytes);
   }
@@ -524,7 +532,7 @@ async function trashBatch(items) {
 
   try {
     await ensureDir(trashDir);
-    await cleanupTrashExpired();
+    await runTrashCleanup("trash_batch");
   } catch (err) {
     return { ok: false, error: "trash cleanup failed" };
   }
@@ -535,7 +543,7 @@ async function trashBatch(items) {
   for (const item of items) {
     try {
       const target = buildTrashPath(item.id);
-      const finalTarget = await moveToTrashWithCleanup(item.absPath, target);
+      const finalTarget = await moveToTrashWithCleanup(item.absPath, target, item.id);
       await touchNow(finalTarget);
       movedIds.push(item.id);
     } catch (err) {
@@ -555,19 +563,25 @@ function buildTrashPath(relId) {
   return safeJoin(trashDir, relId);
 }
 
-async function moveToTrashWithCleanup(sourcePath, targetPath) {
+async function moveToTrashWithCleanup(sourcePath, targetPath, relId) {
   await ensureDir(path.dirname(targetPath));
-  const finalTarget = await ensureUniquePath(targetPath);
+  const finalTarget = await ensureTrashTargetPath(targetPath, relId);
 
   while (true) {
     try {
       await moveFile(sourcePath, finalTarget);
+      if (isDbTrashPath(relId)) {
+        await cleanupDbTrashDuplicatesForCanonicalId(relId);
+      }
       return finalTarget;
     } catch (err) {
       if (err && err.code === "ENOSPC") {
-        const removed = await cleanupTrashAll();
-        if (removed === 0) {
-          throw err;
+        const summary = await cleanupTrashExpired({ force: true });
+        if (summary.total_removed === 0 && summary.db_normalized === 0) {
+          const removed = await cleanupTrashAll();
+          if (removed === 0) {
+            throw err;
+          }
         }
         continue;
       }
@@ -618,6 +632,13 @@ async function ensureUniquePath(targetPath) {
   }
 }
 
+async function ensureTrashTargetPath(targetPath, relId) {
+  if (isDbTrashPath(relId)) {
+    return targetPath;
+  }
+  return ensureUniquePath(targetPath);
+}
+
 async function touchNow(filePath) {
   const now = new Date();
   try {
@@ -627,26 +648,52 @@ async function touchNow(filePath) {
   }
 }
 
-async function cleanupTrashExpired() {
+async function cleanupTrashExpired(options = {}) {
+  const force = options.force === true;
+  const summary = {
+    db_removed: 0,
+    db_normalized: 0,
+    expired_removed: 0,
+    all_removed: 0,
+    failed: 0,
+    total_removed: 0,
+  };
   const now = Date.now();
   if (
+    !force
+    && (
     lastTrashCleanupAt > 0
     && now - lastTrashCleanupAt
       < config.trash_cleanup_interval_seconds * 1000
+    )
   ) {
-    return 0;
+    return summary;
   }
   lastTrashCleanupAt = now;
-  const files = await listTrashFiles();
+  let files = await listTrashFiles();
   if (files.length === 0) {
-    return 0;
+    return summary;
+  }
+  const dbSummary = await cleanupDbTrashDuplicates(files);
+  summary.db_removed = dbSummary.removed;
+  summary.db_normalized = dbSummary.normalized;
+  summary.failed += dbSummary.failed;
+  if (dbSummary.removed > 0 || dbSummary.normalized > 0) {
+    files = await listTrashFiles();
+    if (files.length === 0) {
+      summary.total_removed = summary.db_removed;
+      return summary;
+    }
   }
   const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
   if (trashMaxBytes > 0 && totalBytes >= trashMaxBytes) {
-    return await cleanupTrashAll(files);
+    summary.all_removed = await cleanupTrashAll(files);
+    summary.total_removed = summary.db_removed + summary.all_removed;
+    return summary;
   }
   if (!trashTtlMs || trashTtlMs <= 0) {
-    return 0;
+    summary.total_removed = summary.db_removed;
+    return summary;
   }
   const expired = files
     .filter((file) => now - file.mtimeMs > trashTtlMs)
@@ -662,7 +709,9 @@ async function cleanupTrashExpired() {
       continue;
     }
   }
-  return removed;
+  summary.expired_removed = removed;
+  summary.total_removed = summary.db_removed + removed;
+  return summary;
 }
 
 async function cleanupTrashAll(prefetched) {
@@ -692,6 +741,142 @@ async function listTrashFiles() {
     }
     throw err;
   }
+}
+
+function scheduleTrashCleanup() {
+  const intervalMs = config.trash_cleanup_interval_seconds * 1000;
+  setInterval(() => {
+    runTrashCleanup("interval").catch((err) => {
+      console.error("periodic trash cleanup failed", err);
+    });
+  }, intervalMs);
+}
+
+async function runTrashCleanup(trigger, options = {}) {
+  if (trashCleanupPromise) {
+    return trashCleanupPromise;
+  }
+  trashCleanupPromise = (async () => {
+    try {
+      const summary = await cleanupTrashExpired(options);
+      if (summary.total_removed > 0 || summary.db_normalized > 0 || summary.failed > 0) {
+        console.log(
+          `[trash-cleanup] trigger=${trigger} db_removed=${summary.db_removed} db_normalized=${summary.db_normalized} expired_removed=${summary.expired_removed} all_removed=${summary.all_removed} failed=${summary.failed}`,
+        );
+      }
+      return summary;
+    } finally {
+      trashCleanupPromise = null;
+    }
+  })();
+  return trashCleanupPromise;
+}
+
+function normalizeTrashRelId(relId) {
+  return String(relId || "").replace(/\\/g, "/").replace(/^\/+/, "");
+}
+
+function isDbTrashPath(relId) {
+  const normalized = normalizeTrashRelId(relId).toLowerCase();
+  return normalized.startsWith("db/");
+}
+
+function getTrashCanonicalId(relId) {
+  const normalized = normalizeTrashRelId(relId);
+  const match = TRASH_DUP_SUFFIX_RE.exec(normalized);
+  return match ? match[1] : normalized;
+}
+
+async function cleanupDbTrashDuplicates(prefetched) {
+  const files = Array.isArray(prefetched) ? prefetched : await listTrashFiles();
+  const groups = new Map();
+  for (const file of files) {
+    const canonicalId = getTrashCanonicalId(file.id);
+    if (!isDbTrashPath(canonicalId)) {
+      continue;
+    }
+    const list = groups.get(canonicalId) || [];
+    list.push(file);
+    groups.set(canonicalId, list);
+  }
+  const summary = { removed: 0, normalized: 0, failed: 0 };
+  for (const [canonicalId, entries] of groups.entries()) {
+    const itemSummary = await cleanupDbTrashGroup(canonicalId, entries);
+    summary.removed += itemSummary.removed;
+    summary.normalized += itemSummary.normalized;
+    summary.failed += itemSummary.failed;
+  }
+  return summary;
+}
+
+async function cleanupDbTrashDuplicatesForCanonicalId(canonicalId) {
+  const normalizedCanonicalId = getTrashCanonicalId(canonicalId);
+  if (!isDbTrashPath(normalizedCanonicalId)) {
+    return { removed: 0, normalized: 0, failed: 0 };
+  }
+  const groupDir = path.dirname(buildTrashPath(normalizedCanonicalId));
+  const relDir = path.relative(trashDir, groupDir).split(path.sep).join("/");
+  let files = [];
+  try {
+    files = await listFiles(groupDir);
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return { removed: 0, normalized: 0, failed: 0 };
+    }
+    throw err;
+  }
+  const entries = files
+    .map((file) => ({
+      ...file,
+      id: relDir ? `${relDir}/${file.id}` : file.id,
+    }))
+    .filter((file) => getTrashCanonicalId(file.id) === normalizedCanonicalId);
+  if (entries.length === 0) {
+    return { removed: 0, normalized: 0, failed: 0 };
+  }
+  return cleanupDbTrashGroup(normalizedCanonicalId, entries);
+}
+
+async function cleanupDbTrashGroup(canonicalId, entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return { removed: 0, normalized: 0, failed: 0 };
+  }
+  const summary = { removed: 0, normalized: 0, failed: 0 };
+  const sorted = entries.slice().sort(compareTrashFilesDesc);
+  const latestEntry = sorted[0];
+  const canonicalPath = buildTrashPath(canonicalId);
+  const canonicalEntry = entries.find((entry) => entry.id === canonicalId) || null;
+
+  if (latestEntry.id !== canonicalId) {
+    try {
+      await fs.promises.rename(latestEntry.absPath, canonicalPath);
+      summary.normalized += 1;
+    } catch (err) {
+      summary.failed += 1;
+      return summary;
+    }
+  }
+
+  for (const entry of entries) {
+    if (entry === latestEntry || entry === canonicalEntry) {
+      continue;
+    }
+    try {
+      await fs.promises.unlink(entry.absPath);
+      await removeEmptyParents(path.dirname(entry.absPath), trashDir);
+      summary.removed += 1;
+    } catch (err) {
+      summary.failed += 1;
+    }
+  }
+  return summary;
+}
+
+function compareTrashFilesDesc(a, b) {
+  if (a.mtimeMs !== b.mtimeMs) {
+    return b.mtimeMs - a.mtimeMs;
+  }
+  return b.id.localeCompare(a.id);
 }
 
 async function removeEmptyParents(startDir, rootDir) {
