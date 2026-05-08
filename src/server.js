@@ -9,6 +9,7 @@ const { ensureDir, readJson, writeJson, safeJoin } = require("./shared/fs");
 const { listFiles } = require("./shared/scan");
 const { normalizeIdx, compareIdx, isAfter } = require("./shared/idx");
 const DEFAULT_TRASH_MAX_BYTES = 3 * 1024 * 1024 * 1024;
+const DEFAULT_STATE_MAX_BYTES = 128 * 1024 * 1024;
 const DEFAULT_TRASH_CLEANUP_INTERVAL_SECONDS = 60;
 const TRASH_DUP_SUFFIX_RE = /^(.*)\.dup-(\d+)-(\d+)$/i;
 
@@ -24,6 +25,7 @@ const deletionsPath = path.join(stateDir, "deletions.jsonl");
 const trashDir = path.resolve(process.cwd(), config.trash_dir);
 const trashTtlMs = config.trash_ttl_days * 24 * 60 * 60 * 1000;
 const ackTimeoutMs = config.ack_timeout_seconds * 1000;
+const stateMaxBytes = config.state_max_bytes;
 const trashMaxBytes = config.trash_max_bytes;
 const deletionsLogMaxLines = config.deletions_log_max_lines;
 const deletionsLogCleanupIntervalMs =
@@ -33,6 +35,7 @@ let lastDeletionsCleanupAt = 0;
 let deletionsFileQueue = Promise.resolve();
 let trashCleanupPromise = null;
 let trashBatchQueue = Promise.resolve();
+let stateWriteQueue = Promise.resolve();
 
 const server = http.createServer();
 const wss = new WebSocketServer({ noServer: true });
@@ -226,6 +229,14 @@ function validateConfig(cfg) {
     cfg.ack_timeout_seconds = 120;
   } else {
     cfg.ack_timeout_seconds = Number(cfg.ack_timeout_seconds);
+  }
+  if (cfg.state_max_bytes == null || cfg.state_max_bytes === "") {
+    cfg.state_max_bytes = DEFAULT_STATE_MAX_BYTES;
+  } else {
+    cfg.state_max_bytes = Number(cfg.state_max_bytes);
+  }
+  if (Number.isNaN(cfg.state_max_bytes) || cfg.state_max_bytes < 0) {
+    throw new Error("state_max_bytes must be a non-negative number");
   }
   if (
     !cfg.trash_cleanup_interval_seconds
@@ -449,7 +460,7 @@ async function buildDelta(lastIdx, maxBatchBytes) {
   if (deletions.length > 0) {
     await appendDeletions(deletions);
   }
-  await writeJson(snapshotPath, current);
+  await writeSnapshot(current);
 
   const deletionEvents = await readDeletionsAfter(lastIdx);
 
@@ -534,6 +545,131 @@ function queueTrashBatch(task) {
   const run = trashBatchQueue.then(task, task);
   trashBatchQueue = run.catch(() => {});
   return run;
+}
+
+function queueStateWrite(task) {
+  const run = stateWriteQueue.then(task, task);
+  stateWriteQueue = run.catch(() => {});
+  return run;
+}
+
+async function writeSnapshot(data) {
+  await queueStateWrite(() => writeJsonWithinStateQuota(snapshotPath, data));
+}
+
+async function writeJsonWithinStateQuota(filePath, data) {
+  const raw = JSON.stringify(data, null, 2);
+  await writeTextWithinStateQuota(filePath, raw);
+}
+
+async function writeTextWithinStateQuota(filePath, raw) {
+  await ensureDir(path.dirname(filePath));
+  const nextBytes = Buffer.byteLength(raw, "utf8");
+  const currentBytes = await getFileSizeIfExists(filePath) || 0;
+  const deltaBytes = Math.max(nextBytes - currentBytes, 0);
+  if (!await ensureStateCapacityForIncoming(deltaBytes)) {
+    throw new Error("state max bytes exceeded");
+  }
+  await fs.promises.writeFile(filePath, raw, "utf8");
+}
+
+async function appendTextWithinStateQuota(filePath, raw) {
+  await ensureDir(path.dirname(filePath));
+  const incomingBytes = Buffer.byteLength(raw, "utf8");
+  if (!await ensureStateCapacityForIncoming(incomingBytes)) {
+    throw new Error("state max bytes exceeded");
+  }
+  await fs.promises.appendFile(filePath, raw, "utf8");
+}
+
+async function ensureStateCapacityForIncoming(incomingBytes) {
+  if (!(stateMaxBytes > 0)) {
+    return true;
+  }
+  if (incomingBytes > stateMaxBytes) {
+    return false;
+  }
+
+  let currentBytes = await measureStateDirBytes();
+  if (currentBytes + incomingBytes <= stateMaxBytes) {
+    return true;
+  }
+
+  await compactDeletionsLogToFitDirBudget(Math.max(stateMaxBytes - incomingBytes, 0));
+  currentBytes = await measureStateDirBytes();
+  return currentBytes + incomingBytes <= stateMaxBytes;
+}
+
+async function measureStateDirBytes() {
+  return sumFileSizes(await listStateFiles());
+}
+
+async function listStateFiles() {
+  try {
+    return await listFiles(stateDir);
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return [];
+    }
+    throw err;
+  }
+}
+
+async function compactDeletionsLogToFitDirBudget(maxDirBytes) {
+  const files = await listStateFiles();
+  const totalBytes = sumFileSizes(files);
+  if (totalBytes <= maxDirBytes) {
+    return 0;
+  }
+
+  const deletionsAbsPath = path.resolve(deletionsPath);
+  const deletionsEntry = files.find((file) => path.resolve(file.absPath) === deletionsAbsPath);
+  if (!deletionsEntry) {
+    return 0;
+  }
+
+  const otherBytes = totalBytes - deletionsEntry.size;
+  const allowedDeletionBytes = Math.max(maxDirBytes - otherBytes, 0);
+
+  let raw;
+  try {
+    raw = await fs.promises.readFile(deletionsPath, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return 0;
+    }
+    throw err;
+  }
+
+  const lines = raw.split("\n").filter((line) => line.trim().length > 0);
+  if (lines.length === 0) {
+    return 0;
+  }
+
+  const keep = [];
+  let keptBytes = 0;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    const lineBytes = Buffer.byteLength(`${line}\n`, "utf8");
+    if (keptBytes + lineBytes > allowedDeletionBytes) {
+      break;
+    }
+    keep.push(line);
+    keptBytes += lineBytes;
+  }
+
+  if (keep.length === lines.length) {
+    return 0;
+  }
+
+  if (keep.length === 0) {
+    await safeUnlink(deletionsPath);
+    return lines.length;
+  }
+
+  keep.reverse();
+  await fs.promises.writeFile(deletionsPath, `${keep.join("\n")}\n`, "utf8");
+  return lines.length - keep.length;
 }
 
 async function trashBatchInner(items) {
@@ -1033,7 +1169,7 @@ async function updateSnapshotAfterTrash(movedIds) {
     }
   }
   if (changed) {
-    await writeJson(snapshotPath, snapshot);
+    await writeSnapshot(snapshot);
   }
 }
 
@@ -1043,15 +1179,20 @@ async function appendDeletions(entries) {
   }
   await ensureDir(stateDir);
   const lines = entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
-  deletionsFileQueue = deletionsFileQueue
-    .then(async () => {
-      await fs.promises.appendFile(deletionsPath, lines, "utf8");
+  const run = deletionsFileQueue.then(
+    () => queueStateWrite(async () => {
+      await appendTextWithinStateQuota(deletionsPath, lines);
       await maybeCompactDeletionsLog();
-    })
-    .catch((err) => {
-      console.error("deletions log update failed", err);
-    });
-  await deletionsFileQueue;
+    }),
+    () => queueStateWrite(async () => {
+      await appendTextWithinStateQuota(deletionsPath, lines);
+      await maybeCompactDeletionsLog();
+    }),
+  );
+  deletionsFileQueue = run.catch((err) => {
+    console.error("deletions log update failed", err);
+  });
+  await run;
 }
 
 async function maybeCompactDeletionsLog() {
@@ -1085,9 +1226,7 @@ async function compactDeletionsLog() {
   }
   const keep = lines.slice(lines.length - deletionsLogMaxLines);
   const nextRaw = `${keep.join("\n")}\n`;
-  const tmpPath = `${deletionsPath}.tmp`;
-  await fs.promises.writeFile(tmpPath, nextRaw, "utf8");
-  await fs.promises.rename(tmpPath, deletionsPath);
+  await fs.promises.writeFile(deletionsPath, nextRaw, "utf8");
 }
 
 async function readDeletionsAfter(lastIdx) {

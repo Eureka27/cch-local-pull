@@ -110,6 +110,7 @@ write_server_config() {
   "include_extensions": ${SERVER_INCLUDE_EXTENSIONS},
   "exclude_prefixes": ${SERVER_EXCLUDE_PREFIXES},
   "state_dir": "${REPO_ROOT}/state",
+  "state_max_bytes": 134217728,
   "trash_dir": "${REPO_ROOT}/trash",
   "trash_ttl_days": 7,
   "trash_cleanup_interval_seconds": 60,
@@ -139,6 +140,7 @@ write_client_config() {
     "pass": "${CLIENT_AUTH_PASS}"
   },
   "raw_dir": "${CLIENT_RAW_DIR_ABS}",
+  "storage_max_bytes": 5368709120,
   "reports_dir": "${CLIENT_REPORTS_DIR_ABS}",
   "existing_file_strategy": "${CLIENT_EXISTING_FILE_STRATEGY}",
   "session_merge_prefixes": ${CLIENT_SESSION_MERGE_PREFIXES},

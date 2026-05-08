@@ -10,6 +10,7 @@ async function rebuildSessionFromDup(options) {
     sessionId,
     rawDir,
     reportsDir,
+    ensureCapacityForWrite,
     safeUnlink,
     removeEmptyParents,
   } = options;
@@ -104,6 +105,9 @@ async function rebuildSessionFromDup(options) {
   report.output_event_count = selected.length;
 
   const outputPath = safeJoin(rawDir, `${sessionId}.json`);
+  if (typeof ensureCapacityForWrite === "function") {
+    await ensureCapacityForWrite(outputPath, Buffer.byteLength(renderJsonl(selected), "utf8"));
+  }
   await writeTextAtomic(outputPath, renderJsonl(selected));
 
   const dupFiles = sourceFiles.filter((item) => isDupFileName(path.basename(item.absPath)));
@@ -112,7 +116,7 @@ async function rebuildSessionFromDup(options) {
     await removeEmptyParents(path.dirname(dupFile.absPath), rawDir);
   }
   report.cleaned_dup_file_count = dupFiles.length;
-  await writeDupReport(reportsDir, report);
+  await writeDupReport(reportsDir, report, ensureCapacityForWrite);
   return report;
 }
 
@@ -296,9 +300,13 @@ async function writeTextAtomic(filePath, text) {
   }
 }
 
-async function writeDupReport(reportsDir, report) {
+async function writeDupReport(reportsDir, report, ensureCapacityForWrite) {
   const reportPath = safeJoin(reportsDir, `${report.session_id}.json`);
-  await writeTextAtomic(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  const text = `${JSON.stringify(report, null, 2)}\n`;
+  if (typeof ensureCapacityForWrite === "function") {
+    await ensureCapacityForWrite(reportPath, Buffer.byteLength(text, "utf8"));
+  }
+  await writeTextAtomic(reportPath, text);
 }
 
 function isSessionTopFile(fileName, sessionId) {

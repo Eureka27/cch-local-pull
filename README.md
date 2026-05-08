@@ -119,6 +119,7 @@ Example:
   "include_extensions": [".json", ".jsonl"],
   "exclude_prefixes": ["state/"],
   "state_dir": "./state",
+  "state_max_bytes": 134217728,
   "trash_dir": "./trash",
   "trash_ttl_days": 7,
   "trash_cleanup_interval_seconds": 60,
@@ -141,6 +142,7 @@ Important fields:
 - `include_extensions`
 - `exclude_prefixes`
 - `state_dir`
+- `state_max_bytes`
 - `trash_dir`
 - `trash_ttl_days`
 - `trash_cleanup_interval_seconds`
@@ -163,6 +165,7 @@ Example:
     "pass": "CHANGE_ME"
   },
   "raw_dir": "./pulled/export",
+  "storage_max_bytes": 5368709120,
   "reports_dir": "./state/reports",
   "existing_file_strategy": "overwrite",
   "session_merge_prefixes": ["redis/session_events/"],
@@ -177,6 +180,8 @@ Example:
   "ack_timeout_seconds": 120
 }
 ```
+
+Client `storage_max_bytes` is a hard cap across `raw_dir`, `reports_dir`, and client state files. Set `0` to disable the cap.
 
 Important fields:
 

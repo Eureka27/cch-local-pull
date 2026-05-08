@@ -5,6 +5,7 @@
     "pass": "CHANGE_ME"
   },
   "raw_dir": "./pulled/export",
+  "storage_max_bytes": 5368709120,
   "reports_dir": "./state/reports",
   "existing_file_strategy": "overwrite",
   "session_merge_prefixes": ["redis/session_events/"],

@@ -19,13 +19,19 @@ const DEFAULT_PULL_INTERVAL_SECONDS = 7200;
 const DEFAULT_EAGER_PULL_PENDING_BYTES = 2 * 1024 * 1024 * 1024;
 const DEFAULT_EAGER_PULL_CHECK_INTERVAL_SECONDS = 60;
 const DEFAULT_JSONL_MERGE_STATE_PATH = "./state/jsonl_merge_state.json";
+const DEFAULT_STORAGE_MAX_BYTES = 5 * 1024 * 1024 * 1024;
 
 validateConfig(config);
 
 const stateDir = path.resolve(process.cwd(), path.dirname(config.last_idx_path));
+const rawDir = path.resolve(process.cwd(), config.raw_dir);
+const reportsDir = path.resolve(process.cwd(), config.reports_dir);
+const lastIdxPath = path.resolve(process.cwd(), config.last_idx_path);
+const jsonlMergeStatePath = path.resolve(process.cwd(), config.jsonl_merge_state_path);
 const jsonlMergeState = { files: {} };
 let pulling = false;
 let probing = false;
+let storageWriteQueue = Promise.resolve();
 
 start();
 
@@ -197,7 +203,7 @@ async function doPull(lastIdx) {
         }
         pendingNextIdx = normalizeIdx(msg.next_idx);
         if (!msg.batch_id && !batchId) {
-          await writeJson(config.last_idx_path, pendingNextIdx);
+          await queueStorageWrite(() => writeJsonWithinStorageQuota(lastIdxPath, pendingNextIdx));
           ws.close();
           if (truncated && !runOnce) {
             setTimeout(() => {
@@ -228,7 +234,7 @@ async function doPull(lastIdx) {
           ws.close();
           return;
         }
-        await writeJson(config.last_idx_path, pendingNextIdx);
+        await queueStorageWrite(() => writeJsonWithinStorageQuota(lastIdxPath, pendingNextIdx));
         ws.close();
         if (truncated && !runOnce) {
           setTimeout(() => {
@@ -388,6 +394,14 @@ function validateConfig(cfg) {
   } else {
     cfg.ack_timeout_seconds = Number(cfg.ack_timeout_seconds);
   }
+  if (cfg.storage_max_bytes == null || cfg.storage_max_bytes === "") {
+    cfg.storage_max_bytes = DEFAULT_STORAGE_MAX_BYTES;
+  } else {
+    cfg.storage_max_bytes = Number(cfg.storage_max_bytes);
+  }
+  if (Number.isNaN(cfg.storage_max_bytes) || cfg.storage_max_bytes < 0) {
+    throw new Error("storage_max_bytes must be a non-negative number");
+  }
   if (!cfg.dup_name_strategy) {
     cfg.dup_name_strategy = "suffix-ts-counter";
   }
@@ -437,6 +451,80 @@ function buildBasicAuth(user, pass) {
   const raw = `${user}:${pass}`;
   const encoded = Buffer.from(raw, "utf8").toString("base64");
   return `Basic ${encoded}`;
+}
+
+function queueStorageWrite(task) {
+  const run = storageWriteQueue.then(task, task);
+  storageWriteQueue = run.catch(() => {});
+  return run;
+}
+
+async function ensureStorageCapacityForIncoming(incomingBytes) {
+  if (!(config.storage_max_bytes > 0)) {
+    return true;
+  }
+  if (incomingBytes > config.storage_max_bytes) {
+    return false;
+  }
+  const currentBytes = await measureManagedStorageBytes();
+  return currentBytes + incomingBytes <= config.storage_max_bytes;
+}
+
+async function measureManagedStorageBytes() {
+  let total = 0;
+  for (const root of getManagedStorageRoots()) {
+    total += await measureDirBytes(root);
+  }
+  return total;
+}
+
+function getManagedStorageRoots() {
+  const roots = Array.from(new Set([rawDir, reportsDir, stateDir]))
+    .map((root) => path.resolve(root))
+    .sort((a, b) => a.length - b.length);
+  const result = [];
+  for (const root of roots) {
+    if (result.some((existing) => root === existing || root.startsWith(`${existing}${path.sep}`))) {
+      continue;
+    }
+    result.push(root);
+  }
+  return result;
+}
+
+async function measureDirBytes(rootDir) {
+  try {
+    const files = await listFiles(rootDir);
+    return files.reduce((sum, file) => sum + file.size, 0);
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return 0;
+    }
+    throw err;
+  }
+}
+
+async function getFileSizeIfExists(filePath) {
+  try {
+    const stat = await fs.promises.stat(filePath);
+    return stat.size;
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
+}
+
+async function writeJsonWithinStorageQuota(filePath, data) {
+  const raw = JSON.stringify(data, null, 2);
+  const nextBytes = Buffer.byteLength(raw, "utf8");
+  const currentBytes = await getFileSizeIfExists(filePath) || 0;
+  const deltaBytes = Math.max(nextBytes - currentBytes, 0);
+  if (!await ensureStorageCapacityForIncoming(deltaBytes)) {
+    throw new Error("storage max bytes exceeded");
+  }
+  await writeJson(filePath, data);
 }
 
 function parseJsonMessage(data) {
@@ -530,6 +618,14 @@ async function openFile(msg) {
     : null;
   const version = buildFileVersion(msg);
   await ensureDir(path.dirname(target));
+  const sourceSize = Number(msg.size || 0);
+  if (!Number.isFinite(sourceSize) || sourceSize < 0) {
+    throw new Error("invalid file size");
+  }
+  const hasCapacity = await queueStorageWrite(() => ensureStorageCapacityForIncoming(sourceSize));
+  if (!hasCapacity) {
+    throw new Error("storage max bytes exceeded");
+  }
   const tempPath = makeTempPath(target);
   const stream = fs.createWriteStream(tempPath, { flags: "w" });
   return {
@@ -595,6 +691,14 @@ async function closeFile(fileState, msg) {
       sessionId,
       rawDir: path.dirname(fileState.targetPath),
       reportsDir: config.reports_dir,
+      ensureCapacityForWrite: async (_targetPath, nextBytes) => {
+        const hasCapacity = await queueStorageWrite(
+          () => ensureStorageCapacityForIncoming(nextBytes),
+        );
+        if (!hasCapacity) {
+          throw new Error("storage max bytes exceeded");
+        }
+      },
       safeUnlink,
       removeEmptyParents,
     });
@@ -629,7 +733,7 @@ function hasAppliedJsonlMergeVersion(fileId, version) {
 
 async function setJsonlMergeVersion(fileId, version) {
   jsonlMergeState.files[fileId] = version;
-  await writeJson(config.jsonl_merge_state_path, jsonlMergeState);
+  await queueStorageWrite(() => writeJsonWithinStorageQuota(jsonlMergeStatePath, jsonlMergeState));
 }
 
 async function clearJsonlMergeVersion(fileId) {
@@ -637,10 +741,15 @@ async function clearJsonlMergeVersion(fileId) {
     return;
   }
   delete jsonlMergeState.files[fileId];
-  await writeJson(config.jsonl_merge_state_path, jsonlMergeState);
+  await queueStorageWrite(() => writeJsonWithinStorageQuota(jsonlMergeStatePath, jsonlMergeState));
 }
 
 async function appendFileContents(targetPath, sourcePath) {
+  const sourceBytes = await getFileSizeIfExists(sourcePath) || 0;
+  const hasCapacity = await queueStorageWrite(() => ensureStorageCapacityForIncoming(sourceBytes));
+  if (!hasCapacity) {
+    throw new Error("storage max bytes exceeded");
+  }
   await new Promise((resolve, reject) => {
     const readStream = fs.createReadStream(sourcePath);
     const writeStream = fs.createWriteStream(targetPath, { flags: "a" });
