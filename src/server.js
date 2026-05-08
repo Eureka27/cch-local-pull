@@ -32,6 +32,7 @@ let lastTrashCleanupAt = 0;
 let lastDeletionsCleanupAt = 0;
 let deletionsFileQueue = Promise.resolve();
 let trashCleanupPromise = null;
+let trashBatchQueue = Promise.resolve();
 
 const server = http.createServer();
 const wss = new WebSocketServer({ noServer: true });
@@ -525,30 +526,48 @@ async function buildDelta(lastIdx, maxBatchBytes) {
   };
 }
 
-async function trashBatch(items) {
+function trashBatch(items) {
+  return queueTrashBatch(() => trashBatchInner(items));
+}
+
+function queueTrashBatch(task) {
+  const run = trashBatchQueue.then(task, task);
+  trashBatchQueue = run.catch(() => {});
+  return run;
+}
+
+async function trashBatchInner(items) {
   if (!Array.isArray(items) || items.length === 0) {
     return { ok: true, trashed: 0, missing: 0 };
   }
 
   try {
     await ensureDir(trashDir);
-    await runTrashCleanup("trash_batch_pre");
+    await runTrashCleanup("trash_batch_pre", { force: true });
   } catch (err) {
     return { ok: false, error: "trash cleanup failed" };
   }
 
-  const movedIds = [];
-  let missing = 0;
+  let plan;
+  try {
+    plan = await buildTrashBatchPlan(items);
+    if (!await ensureTrashCapacityForIncoming(plan.incomingBytes)) {
+      return { ok: false, error: "trash max bytes exceeded" };
+    }
+  } catch (err) {
+    return { ok: false, error: "trash planning failed" };
+  }
 
-  for (const item of items) {
+  const movedIds = [];
+
+  for (const item of plan.moves) {
     try {
-      const target = buildTrashPath(item.id);
-      const finalTarget = await moveToTrashWithCleanup(item.absPath, target, item.id);
+      const finalTarget = await moveToTrashWithCleanup(item.absPath, item.targetPath, item.id);
       await touchNow(finalTarget);
       movedIds.push(item.id);
     } catch (err) {
       if (err && err.code === "ENOENT") {
-        missing += 1;
+        plan.missing += 1;
         continue;
       }
       return { ok: false, error: err && err.code ? err.code : "trash failed" };
@@ -562,11 +581,89 @@ async function trashBatch(items) {
   }
 
   await updateSnapshotAfterTrash(movedIds);
-  return { ok: true, trashed: movedIds.length, missing };
+  return { ok: true, trashed: movedIds.length, missing: plan.missing };
 }
 
 function buildTrashPath(relId) {
   return safeJoin(trashDir, relId);
+}
+
+async function buildTrashBatchPlan(items) {
+  const moves = [];
+  let missing = 0;
+  let incomingBytes = 0;
+
+  for (const item of items) {
+    const planned = await planTrashMove(item);
+    if (!planned) {
+      missing += 1;
+      continue;
+    }
+    moves.push(planned);
+    incomingBytes += planned.deltaBytes;
+  }
+
+  return { moves, missing, incomingBytes };
+}
+
+async function planTrashMove(item) {
+  const sourceSize = await getFileSizeIfExists(item.absPath);
+  if (sourceSize == null) {
+    return null;
+  }
+
+  const target = buildTrashPath(item.id);
+  const finalTarget = await ensureTrashTargetPath(target, item.id);
+  let replacedBytes = 0;
+  if (isDbTrashPath(item.id)) {
+    replacedBytes = await getFileSizeIfExists(finalTarget) || 0;
+  }
+
+  return {
+    id: item.id,
+    absPath: item.absPath,
+    targetPath: finalTarget,
+    deltaBytes: Math.max(sourceSize - replacedBytes, 0),
+  };
+}
+
+async function getFileSizeIfExists(filePath) {
+  try {
+    const stat = await fs.promises.stat(filePath);
+    return stat.size;
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
+}
+
+async function ensureTrashCapacityForIncoming(incomingBytes) {
+  if (!(trashMaxBytes > 0) || incomingBytes <= 0) {
+    return true;
+  }
+
+  if (incomingBytes > trashMaxBytes) {
+    return false;
+  }
+
+  let files = await listTrashFiles();
+  let totalBytes = sumFileSizes(files);
+  if (totalBytes + incomingBytes <= trashMaxBytes) {
+    return true;
+  }
+
+  const targetBytes = Math.max(trashMaxBytes - incomingBytes, 0);
+  await cleanupTrashToBudget(files, targetBytes);
+
+  files = await listTrashFiles();
+  totalBytes = sumFileSizes(files);
+  return totalBytes + incomingBytes <= trashMaxBytes;
+}
+
+function sumFileSizes(files) {
+  return files.reduce((sum, file) => sum + file.size, 0);
 }
 
 async function moveToTrashWithCleanup(sourcePath, targetPath, relId) {
@@ -692,7 +789,7 @@ async function cleanupTrashExpired(options = {}) {
     }
   }
 
-  const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+  const totalBytes = sumFileSizes(files);
   if (trashMaxBytes > 0 && totalBytes >= trashMaxBytes) {
     summary.budget_removed = await cleanupTrashToBudget(files, trashMaxBytes);
     summary.total_removed = summary.db_removed + summary.budget_removed;
@@ -745,7 +842,7 @@ async function cleanupTrashToBudget(prefetched, maxBytes) {
     return 0;
   }
   const sorted = [...files].sort((a, b) => a.mtimeMs - b.mtimeMs);
-  let totalBytes = sorted.reduce((sum, file) => sum + file.size, 0);
+  let totalBytes = sumFileSizes(sorted);
   let removed = 0;
   for (const file of sorted) {
     if (totalBytes <= maxBytes) {
