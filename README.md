@@ -19,10 +19,11 @@ Key characteristics:
 - Supported extensions are configurable, for example `.json` and `.jsonl`.
 - Excluded prefixes are configurable, for example `state/`.
 - Acknowledged source files are moved into `trash`.
-- Trash cleanup runs as a background task.
+- Trash cleanup runs at startup and as a background task.
 - The default trash cleanup interval is `60` seconds.
 - The default trash size cap is `3221225472` bytes (`3 GiB`).
-- If trash grows beyond the configured cap, a full trash cleanup may be used as the final fallback.
+- If trash grows beyond the configured cap, the oldest trash files are pruned until usage falls back within budget.
+- Under severe `ENOSPC` conditions, a full trash cleanup may still be used as the final fallback.
 - Under `trash/db/...`, only the latest file for each logical path is retained.
 - Historical `trash/db/*.dup-*` files are pruned during cleanup.
 - Non-`db` paths keep their existing duplicate naming behavior.

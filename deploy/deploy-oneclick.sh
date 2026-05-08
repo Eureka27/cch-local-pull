@@ -112,8 +112,8 @@ write_server_config() {
   "state_dir": "${REPO_ROOT}/state",
   "trash_dir": "${REPO_ROOT}/trash",
   "trash_ttl_days": 7,
-  "trash_cleanup_interval_seconds": 600,
-  "trash_max_bytes": 5368709120,
+  "trash_cleanup_interval_seconds": 60,
+  "trash_max_bytes": 3221225472,
   "auth": {
     "user": "${SERVER_AUTH_USER}",
     "pass": "${SERVER_AUTH_PASS}"

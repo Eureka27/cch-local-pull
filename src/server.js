@@ -532,7 +532,7 @@ async function trashBatch(items) {
 
   try {
     await ensureDir(trashDir);
-    await runTrashCleanup("trash_batch");
+    await runTrashCleanup("trash_batch_pre");
   } catch (err) {
     return { ok: false, error: "trash cleanup failed" };
   }
@@ -553,6 +553,12 @@ async function trashBatch(items) {
       }
       return { ok: false, error: err && err.code ? err.code : "trash failed" };
     }
+  }
+
+  try {
+    await runTrashCleanup("trash_batch_post", { force: true });
+  } catch (err) {
+    return { ok: false, error: "trash cleanup failed" };
   }
 
   await updateSnapshotAfterTrash(movedIds);
@@ -576,12 +582,13 @@ async function moveToTrashWithCleanup(sourcePath, targetPath, relId) {
       return finalTarget;
     } catch (err) {
       if (err && err.code === "ENOSPC") {
-        const summary = await cleanupTrashExpired({ force: true });
+        const summary = await runTrashCleanup("enospc", { force: true });
         if (summary.total_removed === 0 && summary.db_normalized === 0) {
           const removed = await cleanupTrashAll();
           if (removed === 0) {
             throw err;
           }
+          console.log(`[trash-cleanup] trigger=enospc-fallback fallback_removed=${removed}`);
         }
         continue;
       }
@@ -653,19 +660,17 @@ async function cleanupTrashExpired(options = {}) {
   const summary = {
     db_removed: 0,
     db_normalized: 0,
+    budget_removed: 0,
     expired_removed: 0,
-    all_removed: 0,
     failed: 0,
     total_removed: 0,
   };
   const now = Date.now();
   if (
     !force
-    && (
-    lastTrashCleanupAt > 0
+    && lastTrashCleanupAt > 0
     && now - lastTrashCleanupAt
       < config.trash_cleanup_interval_seconds * 1000
-    )
   ) {
     return summary;
   }
@@ -674,6 +679,7 @@ async function cleanupTrashExpired(options = {}) {
   if (files.length === 0) {
     return summary;
   }
+
   const dbSummary = await cleanupDbTrashDuplicates(files);
   summary.db_removed = dbSummary.removed;
   summary.db_normalized = dbSummary.normalized;
@@ -685,10 +691,11 @@ async function cleanupTrashExpired(options = {}) {
       return summary;
     }
   }
+
   const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
   if (trashMaxBytes > 0 && totalBytes >= trashMaxBytes) {
-    summary.all_removed = await cleanupTrashAll(files);
-    summary.total_removed = summary.db_removed + summary.all_removed;
+    summary.budget_removed = await cleanupTrashToBudget(files, trashMaxBytes);
+    summary.total_removed = summary.db_removed + summary.budget_removed;
     return summary;
   }
   if (!trashTtlMs || trashTtlMs <= 0) {
@@ -732,6 +739,30 @@ async function cleanupTrashAll(prefetched) {
   return removed;
 }
 
+async function cleanupTrashToBudget(prefetched, maxBytes) {
+  const files = Array.isArray(prefetched) ? prefetched : await listTrashFiles();
+  if (files.length === 0) {
+    return 0;
+  }
+  const sorted = [...files].sort((a, b) => a.mtimeMs - b.mtimeMs);
+  let totalBytes = sorted.reduce((sum, file) => sum + file.size, 0);
+  let removed = 0;
+  for (const file of sorted) {
+    if (totalBytes <= maxBytes) {
+      break;
+    }
+    try {
+      await fs.promises.unlink(file.absPath);
+      await removeEmptyParents(path.dirname(file.absPath), trashDir);
+      totalBytes -= file.size;
+      removed += 1;
+    } catch (err) {
+      continue;
+    }
+  }
+  return removed;
+}
+
 async function listTrashFiles() {
   try {
     return await listFiles(trashDir);
@@ -761,7 +792,7 @@ async function runTrashCleanup(trigger, options = {}) {
       const summary = await cleanupTrashExpired(options);
       if (summary.total_removed > 0 || summary.db_normalized > 0 || summary.failed > 0) {
         console.log(
-          `[trash-cleanup] trigger=${trigger} db_removed=${summary.db_removed} db_normalized=${summary.db_normalized} expired_removed=${summary.expired_removed} all_removed=${summary.all_removed} failed=${summary.failed}`,
+          `[trash-cleanup] trigger=${trigger} db_removed=${summary.db_removed} db_normalized=${summary.db_normalized} budget_removed=${summary.budget_removed} expired_removed=${summary.expired_removed} failed=${summary.failed}`,
         );
       }
       return summary;
